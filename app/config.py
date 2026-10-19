@@ -20,6 +20,12 @@ class Settings:
         default_factory=lambda: int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(100 * 1024 * 1024)))
     )
 
+    runtime_cache_max_size: int = field(
+        default_factory=lambda: int(os.getenv("RUNTIME_CACHE_MAX_SIZE", "16"))
+    )
+
     def __post_init__(self) -> None:
         if type(self.max_upload_size_bytes) is not int or self.max_upload_size_bytes <= 0:
             raise ValueError("max_upload_size_bytes must be a strictly positive integer")
+        if type(self.runtime_cache_max_size) is not int or self.runtime_cache_max_size <= 0:
+            raise ValueError("runtime_cache_max_size must be a strictly positive integer")

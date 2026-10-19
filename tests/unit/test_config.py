@@ -36,3 +36,27 @@ def test_invalid_upload_size(monkeypatch, size):
     monkeypatch.setenv("MAX_UPLOAD_SIZE_BYTES", size)
     with pytest.raises(ValueError):
         Settings()
+
+
+def test_runtime_cache_default(monkeypatch):
+    monkeypatch.delenv("RUNTIME_CACHE_MAX_SIZE", raising=False)
+    assert Settings().runtime_cache_max_size == 16
+
+
+def test_runtime_cache_environment_override(monkeypatch):
+    monkeypatch.setenv("RUNTIME_CACHE_MAX_SIZE", "3")
+    assert Settings().runtime_cache_max_size == 3
+    assert Settings(runtime_cache_max_size=5).runtime_cache_max_size == 5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5"])
+def test_invalid_runtime_cache_environment(monkeypatch, value):
+    monkeypatch.setenv("RUNTIME_CACHE_MAX_SIZE", value)
+    with pytest.raises(ValueError):
+        Settings()
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_invalid_runtime_cache_constructor(value):
+    with pytest.raises(ValueError):
+        Settings(runtime_cache_max_size=value)

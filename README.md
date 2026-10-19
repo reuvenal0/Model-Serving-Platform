@@ -3,13 +3,14 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 2 ג€” Model Registry & Persistence
+## Current scope: Phase 3 - Model Execution & Runtime Management
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
 Python service. Phase 2.5 adds controlled logical deployment transitions and safe
-routing configuration updates. Registry entities, persistence, and storage remain
-unchanged; Phase 3 has not been implemented.
+routing configuration updates. Phase 3 adds real trusted sklearn/ONNX loading,
+in-process prediction, and lazy, thread-safe runtime caching. Existing domain
+invariants, registry behavior, persistence, and storage remain unchanged.
 
 ```text
 ModelRegistry
@@ -45,21 +46,24 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-The suite includes the original 96 Phase 1 tests, registry unit tests with mocked
-interfaces, and integration tests using temporary SQLite databases and artifact
-roots. It tests foreign keys, independent repository instances, UTC precision,
-path safety, complete binary content, collisions, and compensating-action failures.
+The suite retains all 328 tests from Phases 1, 2, and 2.5. Execution tests build
+small deterministic models locally, with no artifact downloads. Integration tests
+use temporary SQLite databases and storage roots; event/barrier-controlled tests
+verify cache concurrency and invalidation races without timing sleeps.
 
 Run the repeatable demonstration after installing the project:
 
 ```bash
 python examples/registry_demo.py
+python examples/inference_demo.py
 ```
 
-It initializes temporary storage, injects both adapters, registers a sample model
-and version, lists them, downloads harmless binary data, and verifies exact byte
-identity. Its database engine is disposed and temporary data is removed on exit.
-It never loads or executes the artifact.
+The registry demo registers and retrieves harmless binary data without executing
+it. The inference demo trains a trusted local sklearn model for `y = 2*x + 1`,
+registers its Pickle bytes, predicts twice, verifies runtime identity reuse, and
+prints cache statistics. It also builds and executes an equivalent ONNX graph
+using the `onnx` development dependency. Both demos dispose their database engines
+and remove temporary data on exit. Neither starts an API server.
 
 ## Metadata persistence
 
@@ -152,6 +156,130 @@ unavailable bytes; inspect storage and retry `storage.delete(error.artifact_key)
 directly if the artifact remains. Retrying registry deletion after this partial
 failure will report a missing version.
 
+## Phase 3 execution architecture
+
+```text
+ModelRuntimeManager
+  +-- ModelRepository -> version metadata
+  +-- ArtifactStorage -> bytes at the stored logical key
+  +-- ModelLoaderRegistry -> injected ModelFramework-to-ModelLoader mapping
+        +-- SklearnModelLoader -> SklearnLoadedModel
+        +-- OnnxModelLoader    -> OnnxLoadedModel
+```
+
+`LoadedModel` is a minimal protocol with `predict(inputs) -> outputs` and no
+knowledge of loading, storage, or databases. `ModelLoader.load(artifact: bytes)`
+creates one reusable runtime. The manager selects a loader through the injected
+registry; it imports no sklearn, NumPy, ONNX Runtime, or concrete adapter. There
+is no additional executor/factory hierarchy.
+
+Explicit composition (see the inference demo for the repository and storage):
+
+```python
+loaders = ModelLoaderRegistry({
+    ModelFramework.SKLEARN: SklearnModelLoader(trusted=True),
+    ModelFramework.ONNX: OnnxModelLoader(),
+})
+manager = ModelRuntimeManager(
+    repository, storage, loaders,
+    max_cache_size=settings.runtime_cache_max_size,
+)
+runtime = manager.get_runtime("model-name", "v1")
+predictions = runtime.predict([[1.0]])
+```
+
+### Lazy loading and cache lifecycle
+
+Constructing the manager loads nothing. The first `get_runtime(model_name,
+version)` retrieves metadata, requires status REGISTERED, retrieves bytes, selects
+a loader, and loads a runtime. INVALID versions are rejected without changing
+their status or touching artifacts. Cache keys are `(model_name, version)`;
+registered artifacts and their metadata are assumed immutable while cached.
+Hits reuse the same runtime and promote its LRU position. A completed load evicts
+the least recently used entry when the positive integer capacity is exceeded.
+
+The global bookkeeping lock is never held while reading metadata/storage,
+deserializing models, waiting on other loads, or predicting. Requests for the same
+uncached key share one loading future, including its error. Different keys can
+load concurrently. Failed loads never enter the cache; the next request retries.
+Loaders must support concurrent `load` calls for different keys. Built-in adapters
+keep per-load state local and serialize predictions per runtime, using a separate
+lock that does not block other models. Callers must not modify input buffers while
+prediction is running or access/mutate private backend state.
+
+`invalidate(name, version)` removes a completed entry and detaches any in-progress
+load. Existing callers waiting for that load still receive its runtime or error,
+but completion cannot restore the invalidated entry. A later request may start a
+new generation immediately. Old success/failure cannot overwrite or remove that
+new generation. `clear()` applies the same semantics to every tracked key. Neither
+operation cancels native loading, closes runtimes, or invalidates a runtime held
+by another caller. Eviction releases only cache references; Python/native memory
+is not guaranteed to be reclaimed immediately.
+
+`cache_info()` returns an immutable snapshot of lifetime `hits`, `misses`, `waits`,
+`loads`, `load_failures`, and `evictions`, plus `current_size`, `max_size`, and
+`in_flight`. Misses include waiting requests; loads count attempts by load owners.
+`in_flight` counts current tracked generations, excluding detached work that can
+still be running. `clear()` leaves the cumulative statistics intact.
+
+### sklearn input contract and artifact trust
+
+`SklearnModelLoader` accepts standard Pickle bytes containing a fitted sklearn
+`BaseEstimator` with a callable `predict`. No paths or joblib-specific formats
+are required/supported. Predictions delegate validation to the estimator and
+return its native output (typically a NumPy array). For the demo's numeric
+estimator, inputs are 2D feature lists or NumPy arrays of shape
+`(samples, features)`; other supported shapes/types depend on the trained estimator
+or pipeline. One loaded estimator is reused for repeated predictions.
+
+**Only enable `trusted=True` for artifacts whose source and contents you trust.**
+Pickle/joblib deserialization can execute arbitrary code. The flag records caller
+acknowledgement; it does not authenticate data, inspect malicious payloads, or
+provide a security sandbox. Loading is refused before deserialization without
+that opt-in. Store trusted models in a private artifact root and use matching
+training/serving dependencies. sklearn's incompatibility warnings are not
+suppressed; cross-version model compatibility is not guaranteed. See sklearn's
+[model persistence guidance](https://scikit-learn.org/stable/model_persistence.html).
+
+### ONNX input/output contract
+
+`OnnxModelLoader` creates one reusable CPU `InferenceSession` directly from bytes,
+with one intra-op/inter-op thread per session. It discovers read-only input/output
+metadata (names, ONNX tensor types, shape tuples) and supports self-contained
+graphs with known tensor ranks and these dense input/output types:
+
+| ONNX type | NumPy dtype |
+| --- | --- |
+| `tensor(float)` | `float32` |
+| `tensor(double)` | `float64` |
+| `tensor(int32)` | `int32` |
+| `tensor(int64)` | `int64` |
+| `tensor(bool)` | `bool` |
+
+Pass a mapping of every input name to its tensor. For single-input graphs, a raw
+NumPy array or nested Python list/tuple is also accepted. Arrays must already
+have exactly the expected dtype. Numeric Python sequences are converted to the
+declared dtype; strings are not coerced, boolean-only sequences cannot become
+numeric features, and floating values cannot be truncated into integers. Integer range and
+floating-conversion overflow are checked. Ranks, fixed dimensions, and consistent
+shared symbolic dimensions are validated before session execution. Missing and
+extra inputs are errors. Outputs are always `{output_name: numpy_array}`.
+
+Strings, maps, sequences, sparse/optional tensors, unknown ranks, custom operators,
+external tensor files, and GPU execution are outside the adapter contract. ORT
+operator/opset support still applies. Graphs are executed in-process; this also
+is not a sandbox. See the [ONNX Runtime Python API](https://onnxruntime.ai/docs/api/python/api_summary.html).
+
+### Execution failures
+
+Existing `ModelVersionNotFoundError`, `ArtifactNotFoundError`, and repository/storage
+errors propagate unchanged. `UnsupportedFrameworkError` reports an unconfigured
+or invalid framework. `ModelLoadingError` reports unusable/corrupted artifacts,
+INVALID version status, or an invalid loader result; its subclass
+`UntrustedArtifactError` reports missing Pickle trust. Backend prediction errors
+and unsupported inputs raise `PredictionError`. Backend causes are chained rather
+than discarded. Failures never silently return `None` or poison the runtime cache.
+
 ## Current limitations
 
 - SQLite and filesystem operations are separate transactions. Compensating actions
@@ -166,8 +294,17 @@ failure will report a missing version.
   enforcement are not implemented. POSIX storage requires hard-link support.
 - Deployment-aware deletion protection belongs to Phase 4; no deployment checks
   exist yet.
-- Model loading/execution, inference, deployment orchestration, REST APIs, traffic
-  routing, metrics, authentication, background workers, and cloud adapters are not
+- Model loading and prediction run inside the application process, with no worker
+  subprocess, process isolation, timeout, cancellation, or resource enforcement.
+  A bad artifact/backend can exhaust resources or crash the process.
+- Runtime caches are process-local and count models, not memory bytes. Concurrent
+  in-progress loads are not capacity-limited. Each runtime serializes its own
+  predictions, favoring safety over throughput.
+- Registry deletion/re-registration does not automatically notify runtime caches.
+  Callers must invalidate affected entries or clear caches and coordinate any
+  concurrent registry changes. Existing users of a detached runtime may finish.
+- Deployment orchestration, REST APIs, traffic routing, metrics, authentication,
+  background workers, cloud adapters, and distributed coordination are not
   implemented. The `api` package remains empty.
 
 ## Domain conventions
@@ -260,7 +397,10 @@ Explicit constructor values override environment defaults.
 | `ARTIFACT_STORAGE_DIR` | `artifacts` (relative to the working directory) |
 | `DATABASE_URL` | `sqlite:///./model_serving.db` |
 | `MAX_UPLOAD_SIZE_BYTES` | `104857600` (100 MiB; positive integer) |
+| `RUNTIME_CACHE_MAX_SIZE` | `16` (positive integer; completed runtime entries) |
 
 The database URL and artifact directory configure the adapters when explicitly
 constructed. Importing configuration initializes no services. The upload-size
-setting is reserved for a future upload boundary and is not enforced in Phase 2.
+setting is reserved for a future upload boundary and is not enforced. Pass
+`settings.runtime_cache_max_size` to the runtime manager's `max_cache_size`
+constructor parameter; the manager does not read environment variables itself.

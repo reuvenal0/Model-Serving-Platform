@@ -70,3 +70,19 @@ class RegistryConsistencyError(DomainError):
         self.operation_error = operation_error
         self.cleanup_error = cleanup_error
         super().__init__(f"{message} Artifact key: {artifact_key!r}")
+
+
+class UnsupportedFrameworkError(DomainError):
+    """No model loader is configured for the requested framework."""
+
+
+class ModelLoadingError(DomainError):
+    """An artifact could not become a usable loaded model."""
+
+
+class UntrustedArtifactError(ModelLoadingError):
+    """Pickle loading was attempted without explicit source trust."""
+
+
+class PredictionError(DomainError):
+    """Prediction inputs are unsupported or backend execution failed."""
