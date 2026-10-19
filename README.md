@@ -3,11 +3,13 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 2 — Model Registry & Persistence
+## Current scope: Phase 2 ג€” Model Registry & Persistence
 
-Phase 1 domain entities and validation rules remain unchanged. Phase 2 adds model
-and version registration, persistent SQLite metadata, local binary artifact
-storage, artifact downloads, and version deletion through a Python service.
+Phase 2 provides model and version registration, persistent SQLite metadata,
+local binary artifact storage, artifact downloads, and version deletion through a
+Python service. Phase 2.5 adds controlled logical deployment transitions and safe
+routing configuration updates. Registry entities, persistence, and storage remain
+unchanged; Phase 3 has not been implemented.
 
 ```text
 ModelRegistry
@@ -171,15 +173,18 @@ failure will report a missing version.
 ## Domain conventions
 
 - Dataclasses validate at construction and raise `DomainValidationError` for
-  invalid domain values. Entities are mutable snapshots; future application
-  operations must construct validated replacements when changing validated fields.
-- `ResourceConfig` is a frozen value object. Routing weights are copied on
-  construction to prevent caller dictionary changes from affecting the snapshot.
+  invalid domain values. `Model`, `ModelVersion`, and `InferenceLog` remain mutable
+  snapshots. The repository revalidates models and versions before writing them.
+  Deployment and routing fields reject direct assignment; their explicit methods
+  control changes while preserving invariants.
+- `ResourceConfig` remains an immutable value object. Routing weights are copied
+  on construction and replacement and exposed as a read-only mapping.
 - Required identifiers reject blank strings without changing supplied names.
   Version identifiers and artifact locations remain opaque strings.
 - All timestamp defaults are aware UTC datetimes. Supplied aware timestamps are
   normalized to UTC; naive timestamps are rejected. Updates to `updated_at` are
-  explicit, with no automatic lifecycle behavior in this phase.
+  explicit for registry snapshots. Successful deployment operations and routing
+  updates refresh `updated_at` automatically.
 - Enum members are required at construction; raw string conversion belongs at
   future system boundaries. Enum values use lowercase strings.
 - Numeric counts and weights reject booleans and fractional values; CPU and
@@ -189,6 +194,59 @@ failure will report a missing version.
   metadata; no schema language or schema validation is imposed yet.
 - Inference logs store request metadata and an optional input hash, never raw
   input payloads.
+
+## Controlled domain operations
+
+`Deployment.activate()`, `fail()`, and `stop()` record logical state changes.
+They perform no external deployment, health checks, cleanup, or orchestration.
+A future DeploymentManager performs infrastructure work and then records its
+result through these methods. Allowed transitions are deliberately limited:
+
+| Current status | `activate()` | `fail()` | `stop()` | `scale(replicas)` |
+| --- | --- | --- | --- | --- |
+| DEPLOYING | RUNNING | FAILED | STOPPED | Allowed |
+| RUNNING | Rejected | FAILED | STOPPED | Allowed |
+| FAILED | Rejected | Rejected | STOPPED | Rejected |
+| STOPPED | Rejected | Rejected | Rejected | Rejected |
+
+Repeated transitions are rejected with `InvalidDeploymentStateError`, including
+repeated stopping. Retry/restart policy is deferred; no method implicitly restarts
+a failed or stopped deployment. Construction still accepts all existing enum
+statuses to support restoring snapshots. Replica counts remain nonnegative
+integers, including zero; booleans and fractional counts are rejected with
+`DomainValidationError` before state eligibility is checked. Scaling changes only
+the logical count. State changes preserve identity, resources, endpoint, replicas,
+and `created_at`; scaling preserves status. Successful operations refresh
+`updated_at` in UTC. Rejected operations leave the entity unchanged.
+
+`RoutingConfig.update_weights(weights)` validates and copies a complete
+replacement before publishing it and refreshing `updated_at`. The same rules
+apply to construction and updates: a nonempty mapping, nonblank version names,
+integer weights from 0 to 100, and a total of exactly 100. Invalid updates preserve
+both existing weights and timestamp. Input dictionaries and previously obtained
+read-only weight views remain independent snapshots. No version lookup or routing
+algorithm is performed here.
+
+These two classes use frozen dataclasses to reject public assignment and deletion.
+Only their domain methods use internal assignment to update validated state. They
+are explicitly unhashable because these methods change their values. This is
+protection against accidental mutation, not a security boundary or thread lock.
+Whole-object reconstruction with `dataclasses.replace` remains validated and is
+available for restoring snapshots or supplying a deployment endpoint.
+
+Compatibility: constructor argument names/order, default statuses, and attribute
+reads are preserved. Direct field assignment is intentionally no longer supported
+for deployments and routing configurations. `weights` is now a read-only `Mapping`
+rather than a mutable dictionary; use `dict(config.weights)` when a mutable or
+JSON-serializable export is needed. Generic `dataclasses.asdict`, deepcopy, and
+pickle handling of mapping proxies is not supported; serializers must export
+weights explicitly. The existing registry uses neither deployment nor routing
+serialization, so no ORM or registry changes are needed.
+
+`ModelVersion` still describes registration status (REGISTERED or INVALID), not a
+deployment lifecycle. No status methods were added because validation execution
+and a lifecycle policy have not been specified. `Model`, `ResourceConfig`, enums,
+and the exception hierarchy are unchanged.
 
 ## Configuration
 
