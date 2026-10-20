@@ -19,7 +19,7 @@ def predictions_match(body: dict, expected: list[float], version: str = "v1") ->
     )
 
 
-def verify(base_url: str, deployment_id: str, include_routing: bool = False) -> bool:
+def verify(base_url: str, deployment_id: str, include_routing: bool = False, include_monitoring: bool = False) -> bool:
     checks = [
         ("GET", "/health", None, lambda body: body.get("status") == "ok"),
         ("GET", f"/deployments/{deployment_id}/health", None,
@@ -41,6 +41,18 @@ def verify(base_url: str, deployment_id: str, include_routing: bool = False) -> 
             ("POST", "/predict/demo-linear", {"inputs": [[4.0]]},
              lambda body: body.get("version") in ("v1", "v2")
              and predictions_match(body, [9.0 if body["version"] == "v1" else 13.0], body["version"])),
+        ])
+    if include_monitoring:
+        checks.extend([
+            ("GET", "/metrics/demo-linear", None,
+             lambda body: type(body.get("total_requests")) is int and body["total_requests"] >= 2
+             and type(body.get("error_rate")) in (float, int) and 0 <= body["error_rate"] <= 1
+             and type(body.get("throughput_requests_per_second")) in (float, int)
+             and math.isfinite(body["throughput_requests_per_second"])),
+            ("GET", "/inference-logs?model_name=demo-linear&limit=5", None,
+             lambda body: isinstance(body.get("logs"), list) and 1 <= len(body["logs"]) <= 5
+             and all(isinstance(log, dict) and "request_id" in log
+                     and not {"inputs", "predictions", "error_message"}.intersection(log) for log in body["logs"])),
         ])
     passed = True
     with httpx.Client(base_url=base_url, timeout=30.0, trust_env=False) as client:
@@ -69,8 +81,9 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--deployment-id", default="demo-api-deployment")
     parser.add_argument("--routing", action="store_true", help="Also verify configured v1/v2 automatic routing without mutating it")
+    parser.add_argument("--monitoring", action="store_true", help="Also verify persisted metrics and bounded sanitized logs")
     args = parser.parse_args()
-    raise SystemExit(0 if verify(args.base_url, args.deployment_id, args.routing) else 1)
+    raise SystemExit(0 if verify(args.base_url, args.deployment_id, args.routing, args.monitoring) else 1)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,8 @@ from app.domain._validation import finite_number, nonempty, utc_now, utc_timesta
 @dataclass
 class InferenceLog:
     request_id: str
-    model_name: str
-    version: str
+    model_name: str | None
+    version: str | None
     latency_ms: float
     success: bool
     error_message: str | None = None
@@ -20,8 +20,12 @@ class InferenceLog:
 
     def __post_init__(self) -> None:
         nonempty(self.request_id, "request_id")
-        nonempty(self.model_name, "model_name")
-        nonempty(self.version, "version")
+        # Unknown identifiers are explicit for failures before validation or
+        # routing. Successful observations always identify the executed version.
+        if self.model_name is not None or self.success:
+            nonempty(self.model_name, "model_name")
+        if self.version is not None or self.success:
+            nonempty(self.version, "version")
         finite_number(self.latency_ms, "latency_ms")
         if self.latency_ms < 0:
             raise DomainValidationError("latency_ms cannot be negative")

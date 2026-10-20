@@ -8,12 +8,14 @@ from app.infrastructure.database.database import create_sqlite_engine, initializ
 from app.infrastructure.database.sqlite_deployment_repository import SQLiteDeploymentRepository
 from app.infrastructure.database.sqlite_model_repository import SQLiteModelRepository
 from app.infrastructure.database.sqlite_routing_repository import SQLiteRoutingRepository
+from app.infrastructure.database.sqlite_inference_log_repository import SQLiteInferenceLogRepository
 from app.infrastructure.execution.onnx_model_loader import OnnxModelLoader
 from app.infrastructure.execution.sklearn_model_loader import SklearnModelLoader
 from app.infrastructure.storage.local_artifact_storage import LocalArtifactStorage
 from app.services.deployment_health_checker import DeploymentHealthChecker
 from app.services.deployment_manager import DeploymentManager
 from app.services.inference_service import InferenceService
+from app.services.metrics_collector import MetricsCollector
 from app.services.model_loader_registry import ModelLoaderRegistry
 from app.services.model_registry import ModelRegistry
 from app.services.model_runtime_manager import ModelRuntimeManager
@@ -41,6 +43,8 @@ class ServiceContainer:
             self.model_repository = SQLiteModelRepository(self.session_factory)
             self.deployment_repository = SQLiteDeploymentRepository(self.session_factory)
             self.routing_repository = SQLiteRoutingRepository(self.session_factory)
+            self.inference_log_repository = SQLiteInferenceLogRepository(self.session_factory)
+            self.metrics_collector = MetricsCollector(self.inference_log_repository)
             self.artifact_storage = LocalArtifactStorage(settings.artifact_storage_dir)
             self.model_registry = ModelRegistry(self.model_repository, self.artifact_storage)
             self.loader_registry = ModelLoaderRegistry({
@@ -72,6 +76,7 @@ class ServiceContainer:
                 max_tensor_dimensions=settings.max_tensor_dimensions,
                 max_tensor_elements=settings.max_tensor_elements,
                 traffic_router=self.traffic_router,
+                metrics_collector=self.metrics_collector,
             )
         except BaseException:
             self.engine.dispose()

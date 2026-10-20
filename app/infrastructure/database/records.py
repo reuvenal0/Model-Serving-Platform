@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import CheckConstraint, Float, ForeignKey, ForeignKeyConstraint, JSON, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, ForeignKeyConstraint, Index, JSON, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -124,3 +124,24 @@ class RoutingVersionReferenceRecord(Base):
     model_name: Mapped[str] = mapped_column(String, primary_key=True)
     revision: Mapped[int] = mapped_column(primary_key=True)
     version: Mapped[str] = mapped_column(String, primary_key=True)
+
+
+class InferenceLogRecord(Base):
+    __tablename__ = "inference_logs"
+    __table_args__ = (
+        CheckConstraint("latency_ms >= 0"),
+        CheckConstraint("success IN (0, 1)"),
+        CheckConstraint("success = 0 OR (model_name IS NOT NULL AND version IS NOT NULL)"),
+        Index("ix_inference_logs_time", "timestamp"),
+        Index("ix_inference_logs_model_version_time", "model_name", "version", "timestamp"),
+        Index("ix_inference_logs_model_time", "model_name", "timestamp"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    request_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    model_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    input_hash: Mapped[str | None] = mapped_column(String, nullable=True)

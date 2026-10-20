@@ -9,6 +9,7 @@ from app.core.exceptions import InferenceUnavailableError
 from app.services.deployment_manager import DeploymentManager
 from app.services.inference_service import InferenceService
 from app.services.routing_manager import RoutingManager
+from app.services.metrics_collector import MetricsCollector
 
 
 def get_container(request: Request) -> ServiceContainer:
@@ -34,3 +35,9 @@ def get_routing_manager(
     container: Annotated[ServiceContainer, Depends(get_container)],
 ) -> RoutingManager:
     return container.routing_manager
+
+
+def get_metrics_collector(
+    container: Annotated[ServiceContainer, Depends(get_container)],
+) -> MetricsCollector:
+    return container.metrics_collector

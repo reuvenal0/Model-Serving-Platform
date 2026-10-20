@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, make_url
 
 from app.infrastructure.database.records import Base, DeploymentRecord, ModelRecord, ModelVersionRecord
-from app.infrastructure.database.migrations import migrate_routing
+from app.infrastructure.database.migrations import migrate_monitoring, migrate_routing
 
 
 def create_sqlite_engine(database_url: str) -> Engine:
@@ -31,10 +31,11 @@ def create_sqlite_engine(database_url: str) -> Engine:
 
 
 def initialize_database(engine: Engine) -> None:
-    """Initialize legacy tables and apply the versioned routing migration."""
+    """Initialize legacy tables and apply versioned additive migrations."""
     # Legacy initialization remains unchanged; new routing schema uses a numbered
     # migration, not create_all as an implicit upgrade mechanism.
     Base.metadata.create_all(engine, tables=[
         ModelRecord.__table__, ModelVersionRecord.__table__, DeploymentRecord.__table__,
     ])
     migrate_routing(engine)
+    migrate_monitoring(engine)

@@ -1,6 +1,8 @@
 """Explicit or routed inference, guarded by deployment revision admission."""
 
 from dataclasses import dataclass
+import logging
+from uuid import uuid4
 from time import perf_counter_ns
 from typing import Any
 
@@ -9,6 +11,8 @@ from app.core.exceptions import (
     InferenceUnavailableError, PredictionError, PredictionInputError,
 )
 from app.domain._validation import nonempty
+from app.domain.inference_log import InferenceLog
+from app.services.metrics_collector import MetricsCollector, classify_error
 from app.domain.enums import DeploymentStatus, ModelVersionStatus
 from app.interfaces.deployment_repository import DeploymentRepository
 from app.interfaces.model_repository import ModelRepository
@@ -43,6 +47,7 @@ class InferenceService:
         max_batch_size: int = 128, max_tensor_dimensions: int = 4,
         max_tensor_elements: int = 100000,
         traffic_router: TrafficRouter | None = None,
+        metrics_collector: MetricsCollector | None = None,
     ) -> None:
         if any(type(value) is not int or value <= 0 for value in (
             max_batch_size, max_tensor_dimensions, max_tensor_elements,
@@ -53,18 +58,44 @@ class InferenceService:
         self._runtimes = runtimes
         self._health_checker = health_checker
         self._traffic_router = traffic_router
+        self._metrics_collector = metrics_collector
         self._data = PredictionData(max_batch_size, max_tensor_dimensions, max_tensor_elements)
 
     def predict(self, model_name: str, version: str | None, inputs: Any) -> InferenceResult:
         started = perf_counter_ns()
-        nonempty(model_name, "model_name")
-        if not isinstance(inputs, (list, dict)) or not inputs:
-            raise PredictionInputError("Inputs must be a nonempty tensor or tensor mapping")
-        if version is None:
-            if self._traffic_router is None:
-                raise InferenceUnavailableError("Automatic routing is not configured")
-            version = self._traffic_router.select(model_name).version
-        nonempty(version, "version")
+        selected = version if isinstance(version, str) and version.strip() else None
+        try:
+            nonempty(model_name, "model_name")
+            if not isinstance(inputs, (list, dict)) or not inputs:
+                raise PredictionInputError("Inputs must be a nonempty tensor or tensor mapping")
+            if version is None:
+                if self._traffic_router is None:
+                    raise InferenceUnavailableError("Automatic routing is not configured")
+                selected = self._traffic_router.select(model_name).version
+            nonempty(selected, "version")
+            result = self._execute(model_name, selected, inputs, started)
+        except Exception as error:
+            self._observe(model_name, selected, (perf_counter_ns() - started) / 1_000_000, error)
+            raise
+        self._observe(model_name, selected, result.latency_ms, None)
+        return result
+
+    def _observe(self, model_name: str, version: str | None, latency_ms: float, error: Exception | None) -> None:
+        if self._metrics_collector is None:
+            return
+        try:
+            observation = InferenceLog(
+                request_id=uuid4().hex,
+                model_name=model_name if isinstance(model_name, str) and model_name.strip() else None,
+                version=version, latency_ms=latency_ms, success=error is None,
+                error_message=classify_error(error) if error is not None else None,
+            )
+            self._metrics_collector.record(observation)
+        except Exception:
+            # Never include payloads, backend messages, paths, or exception traces.
+            logging.getLogger(__name__).error("monitoring_write_failed: observation persistence was not confirmed")
+
+    def _execute(self, model_name: str, version: str, inputs: Any, started: int) -> InferenceResult:
         self._models.get_model(model_name)
         metadata = self._models.get_version(model_name, version)
         if metadata.status is not ModelVersionStatus.REGISTERED:

@@ -3,7 +3,7 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 6 - Traffic Routing, Canary Releases & Rollback
+## Current scope: Phase 7 - Monitoring, Inference Logging & Metrics
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
@@ -14,7 +14,9 @@ logical deployments, guarded lifecycle orchestration, conservative readiness,
 startup reconciliation, and deployment-aware deletion safety. Domain invariants
 and the artifact subsystem are unchanged. Phase 5 adds explicit-version inference
 and a small FastAPI transport. Phase 6 adds deployment-aware weighted routing,
-canary allocations, revisioned routing persistence, and validated rollback.
+canary allocations, revisioned routing persistence, and validated rollback. Phase 7
+adds persistent sanitized inference observations and windowed metrics through
+local monitoring endpoints.
 
 ```text
 ModelRegistry
@@ -685,9 +687,9 @@ for local development until authorization and authentication are implemented.
   Callers must invalidate affected entries or clear caches and coordinate any
   concurrent registry changes. Existing users of a detached runtime may finish.
 - Deployment currently means logical readiness in this application instance.
-  Remote/container orchestration, real replica workers, metrics, authentication,
+  Remote/container orchestration, real replica workers, authentication,
   background workers, cloud adapters, and distributed coordination are not implemented.
-  REST endpoints cover prediction, health, and local routing management.
+  REST endpoints cover prediction, health, local routing management, and monitoring.
 
 ## Domain conventions
 
@@ -1033,5 +1035,201 @@ The demo uses temporary SQLite/artifacts, two real sklearn models, a seeded RNG,
 HTTP requests, canary counts, an allocation change, immutable history, rollback,
 a stale-update conflict, and strict rejection after undeploy. Tests additionally
 cover separate repository writers, injected partial failures, and admission races.
-There is no sticky routing, automated canary analysis, rollout scheduler, metrics,
-authentication infrastructure, distributed locking, or Phase 7 implementation.
+There is no sticky routing, automated canary analysis, rollout scheduler,
+authentication infrastructure, distributed locking, or production observability stack.
+
+## Phase 7 monitoring
+
+The application-owned `ServiceContainer` injects `MetricsCollector` into
+`InferenceService`. The collector depends on `InferenceLogRepository`, implemented
+by `SQLiteInferenceLogRepository` using the existing session factory. Monitoring
+routes access the collector, never SQLAlchemy sessions. There are no shared
+mutable request observations, in-memory log buffers, background workers, or
+external monitoring services. The original prediction response fields, routing
+behavior, runtime cache, prediction locks, and deployment admission rules remain
+unchanged. Directly constructed inference services may omit the optional collector
+for compatibility; application-container services have monitoring enabled.
+
+### Observation identity, privacy, and failures
+
+The single observation boundary is `InferenceService.predict()`. `batch_predict()`
+delegates to it, so a batch is **one request**, with one vectorized prediction and
+at most one finalized observation. Explicit and automatically routed attempts use
+the same boundary. Successful inference, in-service validation failures, missing
+models/versions, routing failures, unavailable deployments, revision conflicts,
+loading failures, execution failures, and output normalization failures are observed.
+HTTP/Pydantic failures rejected before entering the service (including malformed
+JSON and oversized bodies), unknown HTTP paths, health checks, routing-management
+operations, and monitoring reads are excluded.
+
+Each finalized attempt receives a fresh UUID observation `request_id`, unrelated
+to model versions or client-provided HTTP headers. It is internal log identity,
+not a transport correlation ID, and is not added to prediction responses. SQLite
+enforces uniqueness: duplicate append raises `DuplicateInferenceLogError` and
+preserves the existing record. No automatic write retry is performed.
+
+`InferenceLog` keeps its constructor argument order and legacy `error_message`
+field. Failed observations may now explicitly use `version=None` if routing has
+not selected a version, and `model_name=None` if identifier validation failed.
+Non-null identifiers must remain nonempty; successful observations still require
+both identifiers. Explicit version attempts retain their requested version even
+if registry lookup later fails. These narrowly scoped nullable fields avoid fake
+version/model identifiers. Existing UTC and finite nonnegative latency validation
+remain intact.
+
+Application observations use `error_message` exclusively for an allowlisted,
+bounded code. The SQL column and HTTP field are named `error_code`. Examples are
+`invalid_input`, `not_found`, `routing_not_found`, `routing_unavailable`,
+`deployment_conflict`, `unavailable`, `runtime_loading_failed`,
+`artifact_unavailable`, `prediction_failed`, `serialization_failed`,
+`model_contract_invalid`, `persistence_unavailable`, `unsupported_framework`, and
+`internal_error`. Raw exception messages and stack traces are never persisted in
+observations. Repository writes reject unrecognized error strings. No raw model
+inputs, prediction outputs, serialized artifacts, credentials, or payload hashes
+are generated/stored by inference monitoring. The preexisting optional `input_hash`
+Domain field is retained for compatibility but application observations leave it
+null, and monitoring DTOs do not expose it.
+
+Monitoring is **best effort**. The service attempts a synchronous, short append
+after finalizing inference, outside deployment/prediction transactions. A write
+failure cannot change a successful result or mask the original inference exception.
+It emits only the sanitized ERROR-level diagnostic `monitoring_write_failed`, without
+backend text, payloads, or exception traces. Monitoring read failures return the
+normal sanitized service error response, never fake zero metrics. Failed writes
+may lose observations; an uncertain commit may already have persisted a record.
+A process crash, termination, or BaseException interruption may leave no observation.
+This is not exactly-once durable delivery or a distributed event pipeline.
+
+### Metric definitions
+
+All calculations use **recorded, finalized service attempts** whose completion
+UTC timestamp falls in the selected half-open interval `[start, end)`, with the
+specified model, version, and optional success filters. A missing version filter
+includes known and unknown versions; `unknown_version=true` selects only null
+versions and cannot be combined with `version`. Per-version results include a
+null-version group when applicable. Querying a model with no observations returns
+zero metrics rather than requiring that model to currently exist in the registry.
+
+| Field | Definition |
+| --- | --- |
+| `total_requests` | Count of recorded attempts matching the filters |
+| `successful_requests` | Count that completed prediction and output normalization/schema validation |
+| `failed_requests` | Total minus successes, including expected user errors and unavailable versions |
+| `error_rate` | Failures / total; 0.0 for zero observations |
+| `throughput_requests_per_second` | Total / selected window duration in seconds |
+| `average_latency_ms` | Arithmetic mean over successful observations only |
+| `p50_latency_ms`, `p95_latency_ms`, `p99_latency_ms` | Exact nearest-rank percentiles over successful observations only |
+
+Latency uses `perf_counter_ns()` elapsed wall-clock time from service entry through
+validation, routing (if used), registry checks, readiness/loading, admission,
+prediction, and output normalization/validation. Failures measure through the point
+of failure. It excludes the subsequent monitoring append, HTTP network transfer,
+HTTP body/Pydantic parsing, and waiting for the HTTP worker thread to start. The
+successful observation latency equals the existing prediction response latency.
+The observation timestamp is recorded at finalization, not request arrival.
+
+For percentile `p`, sort the `n` successful latencies ascending and choose the
+1-based rank `ceil(p*n/100)`. For `[1,2]`, p50 is 1 and p95/p99 are 2. Empty or
+failure-only latency sets produce JSON `null` for mean and percentiles; counts
+and rates remain finite. Counts and exact percentile ranks are computed in SQL,
+using window functions and aggregate queries inside one read transaction. Only
+aggregate rows reach Python; no unbounded log-object list is loaded. The SQL mean
+normalizes by the maximum latency before averaging to avoid summation overflow
+for large finite values. Exact sorting can still be expensive for large windows.
+
+With neither endpoint supplied, the default interval is the **last five minutes**.
+If only `end` is supplied, the interval is the preceding five minutes; if only
+`start` is supplied, `end` is now. Timestamps must be timezone-aware and are
+normalized to UTC. Windows must have positive duration and span at most 31 days.
+Throughput is an observed average over this whole window, including idle time,
+not peak server capacity. These are inference observations, **not a performance
+benchmark**: logging losses, process scheduling, cache state, and the chosen window
+affect interpretation. No liveness or health-check traffic inflates request counts.
+
+### Monitoring API and pagination
+
+All endpoints are local-development-only without authentication/authorization.
+They use the existing synchronous FastAPI thread pool and sanitized error handlers.
+
+| Method | Endpoint | Response |
+| --- | --- | --- |
+| GET | `/metrics` | Aggregate across matching observations |
+| GET | `/metrics/{model_name}` | Aggregate for the path model |
+| GET | `/metrics/{model_name}/versions` | Version-ordered aggregates, null version first |
+| GET | `/inference-logs` | Bounded sanitized log page and next cursor |
+
+Filters are `start`, `end` (aware ISO timestamps), `model_name`, `version`,
+`unknown_version`, and `success`. On model-path endpoints, the path model takes
+precedence over the optional query model. Version aggregation returns at most 200
+groups; requests exceeding that cardinality return 422 and require narrower filters.
+Empty version aggregates are `[]`. Empty ungrouped metrics contain zero counts,
+zero rates, and null latencies. For example:
+
+```json
+{"model_name":"demo-linear","version":null,"start":"2026-10-20T00:00:00Z","end":"2026-10-20T00:05:00Z","total_requests":0,"successful_requests":0,"failed_requests":0,"error_rate":0.0,"throughput_requests_per_second":0.0,"average_latency_ms":null,"p50_latency_ms":null,"p95_latency_ms":null,"p99_latency_ms":null}
+```
+
+Log parameters additionally include `limit` (default 50, range 1..200) and `cursor`
+(default 0, nonnegative insertion ID). Logs are ordered by insertion ID ascending,
+which is stable even for concurrent writes or equal/out-of-order timestamps.
+`next_cursor` is the final returned insertion ID only when another matching row
+exists, otherwise null. Empty pages contain `logs: []`. Example response:
+
+```json
+{"logs":[{"request_id":"observation-uuid","model_name":"demo-linear","version":null,"latency_ms":0.5,"success":false,"error_code":"routing_not_found","timestamp":"2026-10-20T00:01:00Z"}],"next_cursor":null,"start":"2026-10-20T00:00:00Z","end":"2026-10-20T00:05:00Z"}
+```
+
+Reuse the returned `start`/`end` and all filters when following `next_cursor`.
+Pagination is an append-only feed, not a frozen export: newly appended rows with
+matching timestamps may appear on later pages. A fresh default window on each
+page changes the query. No raw SQL IDs, error messages, inputs, or outputs are
+exposed in log records; the cursor is the opaque continuation value to reuse.
+
+Examples in Swagger `/docs` or a browser:
+
+```text
+/metrics/demo-linear?version=v1
+/metrics/demo-linear/versions
+/inference-logs?model_name=demo-linear&success=false&limit=20
+```
+
+### Migration, ownership, and verification
+
+Migration **7** adds only `inference_logs` and indexes for completion time and
+model/version/time filtering. It reuses explicit UTC storage and unique request IDs.
+`initialize_database()` applies numbered migrations 6 and 7 during normal container
+startup. It does not use `create_all()` to migrate monitoring tables. Run startup
+quiescently and back up development data before schema upgrades. Unexpected
+untracked tables fail explicitly; DDL and the migration ledger entry commit
+atomically. Tests simulate an interrupted migration and verify successful retry.
+Existing models, versions, deployment revisions, immutable routing history, and
+artifact bytes are preserved. Logs intentionally have no registry foreign keys:
+failed attempts may refer to missing versions, and observations neither retain
+artifacts nor prevent registry deletion. No retention/purge service is implemented.
+
+No extra connection, session, executor, or cache is globally owned by monitoring.
+Each repository operation uses the injected session factory with its own explicit
+transaction; application shutdown disposes the container's existing engine. Reads
+see committed records in the selected SQLite file, not a production-wide,
+consistent distributed snapshot. SQLite writer contention can delay appends or
+cause best-effort loss; no cross-process delivery or aggregation guarantee is claimed.
+
+```powershell
+python -m pytest -q
+python -m examples.monitoring_demo
+python -m examples.test_live_api --monitoring
+# With optional v2 routing already seeded:
+python -m examples.test_live_api --routing --monitoring
+```
+
+The monitoring demo creates temporary SQLite/artifacts, deploys two trusted sklearn
+versions, configures routing, executes explicit and routed/batched inference,
+records a controlled failure, reads logs and aggregate/per-version metrics, checks
+repository/container restart persistence, and removes temporary data. Existing
+persistent v1/v2 seeders and routing configurations are unchanged. Live verification
+checks metrics/logs optionally; default Phase 5/6 checks remain compatible. Its
+prediction requests naturally add observations but never overwrite artifacts or
+change routing. No automated test writes to persistent development storage.
+
+Phase 8 hardening, Prometheus/Grafana, tracing, OpenTelemetry, brokers, authentication,
+automated canary decisions, autoscaling, and long-term archival remain out of scope.

@@ -157,3 +157,7 @@ class RoutingConflictError(DomainError):
 
 class RoutingUnavailableError(InferenceUnavailableError):
     """An active routing destination is unavailable; no fallback is permitted."""
+
+
+class DuplicateInferenceLogError(DomainError):
+    """An observation ID was already recorded; existing data was preserved."""
