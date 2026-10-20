@@ -3,7 +3,7 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 4 - Deployment Lifecycle & Health Management
+## Current scope: Phase 5 - Inference Service & REST API
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
@@ -12,7 +12,9 @@ routing configuration updates. Phase 3 adds real trusted sklearn/ONNX loading,
 in-process prediction, and lazy, thread-safe runtime caching. Phase 4 adds persistent
 logical deployments, guarded lifecycle orchestration, conservative readiness,
 startup reconciliation, and deployment-aware deletion safety. Domain invariants
-and the artifact subsystem are unchanged. No Phase 5 routing or APIs exist.
+and the artifact subsystem are unchanged. Phase 5 adds explicit-version inference
+and a small FastAPI transport. Weighted routing, canary releases, A/B testing, and
+routing rollback remain reserved for Phase 6.
 
 ```text
 ModelRegistry
@@ -48,7 +50,7 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-The suite retains all 421 tests from Phases 1 through 3. Execution tests build
+The suite retains all 507 tests from Phases 1 through 4. Execution tests build
 small deterministic models locally, with no artifact downloads. Integration tests
 use temporary SQLite databases and storage roots; event/barrier-controlled tests
 verify cache concurrency and invalidation races without timing sleeps.
@@ -59,6 +61,7 @@ Run the repeatable demonstration after installing the project:
 python examples/registry_demo.py
 python examples/inference_demo.py
 python examples/deployment_demo.py
+python examples/api_demo.py
 ```
 
 The registry demo registers and retrieves harmless binary data without executing
@@ -68,7 +71,10 @@ prints cache statistics. It also builds and executes an equivalent ONNX graph
 using the `onnx` development dependency. The deployment demo observes persisted
 DEPLOYING, completes a model-specific readiness check, shows RUNNING, scales logical
 replicas from 1 to 3, reads persisted metadata, stops, and rejects an illegal scale.
-All demos dispose their engines and remove temporary data. None starts a server.
+The API demo creates an application lifespan and uses TestClient to register,
+deploy, predict, batch predict, stop, and verify post-stop rejection. It verifies
+owned cache cleanup on shutdown. All demos dispose their engines and remove
+temporary data. None requires an external server.
 
 ## Metadata persistence
 
@@ -391,7 +397,8 @@ obtains the current shared runtime (lazily reloading after eviction), checks it,
 and re-reads the revision before returning `DeploymentHealth`. If a concurrent
 operation changed the record, it raises a conflict instead of reporting stale
 readiness. This is a point-in-time observation, not an inference authorization
-lease; callers must coordinate any later use. There is no deployment inference API.
+lease; callers must coordinate any later use. Phase 5's InferenceService performs
+its own final revision admission check before executing a request.
 
 The default `load` check proves that a runtime was obtained and exposes predict;
 it does **not** call predict or synthesize a universal feature matrix. Passing
@@ -447,6 +454,211 @@ into `ModelVersionInUseError`. The existing ModelRegistry already deletes metada
 before bytes, so it propagates that error while preserving the artifact.
 Versions with no deployment history retain the original deletion behavior.
 
+## Phase 5 inference and HTTP architecture
+
+```text
+HTTP -> FastAPI synchronous router -> InferenceService
+                                      +-- ModelRepository
+                                      +-- DeploymentRepository (revision snapshots)
+                                      +-- DeploymentHealthChecker
+                                      +-- ModelRuntimeManager -> LoadedModel.predict
+```
+
+The router handles transport/Pydantic DTOs, not SQL or filesystem operations.
+`InferenceService` performs model/version checks, bounded tensor validation,
+deployment admission, runtime readiness, prediction, and output normalization.
+`PredictionData` is its data-format utility; NumPy conversion remains outside the
+Domain. The service never invokes loaders or receives ORM objects. Existing
+Domain, registry, persistence, and runtime-manager semantics remain intact.
+The adapters add a `PredictionInputError` subtype of the existing `PredictionError`
+to distinguish input errors from execution failures without breaking existing
+callers that catch the base class.
+
+New files include `app/services/inference_service.py`,
+`app/services/inference_data.py`, `app/core/container.py`, `app/main.py`,
+`app/api/dependencies.py`, `app/api/routers/inference.py`,
+`app/api/schemas/inference.py`, `app/api/errors.py`, and `app/api/middleware.py`.
+
+### Running the API and ownership
+
+After installing `.[dev]`, start locally:
+
+```bash
+python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Swagger documentation is at `/docs`; `/openapi.json` includes the request,
+response, and structured error schemas. Versions are always explicit; there is no
+implicit latest version or traffic split. Register/deploy models through Python
+services (see the API demo); registration, upload, deployment mutation, and routing
+REST endpoints are outside Phase 5.
+
+Importing `app.main` and calling `create_app(settings)` allocate no application
+graph or database/storage resources. Lifespan startup constructs an owned
+`ServiceContainer` in a worker thread, with the engine, session factory,
+repositories, local storage, loaders/registry, runtime manager, health checker,
+deployment manager, model registry, and inference service. No global sessions
+exist. On shutdown the owned runtime cache is cleared and the engine disposed.
+An explicitly supplied `create_app(container=container)` uses caller-owned resources;
+close that container explicitly or use its context manager. Dependencies can be
+overridden with `app.dependency_overrides[get_inference_service]` or
+`get_deployment_manager`. Tests use temporary **file-backed** SQLite databases;
+the existing in-memory engine is not shared across the HTTP thread pool.
+
+No automatic startup reconciliation sweep mutates another process's deployment
+attempts. Operators may explicitly invoke Phase 4 reconciliation during quiescent
+single-process startup; each inference request independently validates runtime
+readiness and deployment revision even without a sweep. Persisted RUNNING alone
+is never used as verified readiness.
+
+Lifespan ownership follows [FastAPI's lifecycle guidance](https://fastapi.tiangolo.com/advanced/events/).
+Routes use ordinary `def`, so blocking loading/prediction runs through FastAPI's
+[external worker thread pool](https://fastapi.tiangolo.com/async/). Pool workers are
+shared across requests/dependencies and finite; requests may queue. Per-runtime
+prediction locks and native ML thread pools may further constrain concurrency.
+There are no distributed limits, prediction timeouts, cancellation guarantees,
+or process isolation. Servers must drain requests before closing owned resources.
+
+### Endpoints and wire format
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| POST | `/predict/{model_name}` | One vectorized call using the explicit version |
+| POST | `/predict/{model_name}/batch` | Explicit alias for the same bounded batched-tensor call |
+| GET | `/health` | API process liveness only: `{"status":"ok"}` |
+| GET | `/deployments/{deployment_id}/health` | Existing load-readiness check and lifecycle state |
+
+Example sklearn request (after registering/deploying a matching one-feature model):
+
+```json
+{"version": "v1", "inputs": [[3.0], [4.0]]}
+```
+
+Illustrative response (latency and floating-point rounding vary):
+
+```json
+{"model_name": "linear-demo", "version": "v1", "predictions": [7.0, 9.0], "latency_ms": 2.4}
+```
+
+The batch endpoint accepts exactly the same envelope. Both allow one or more
+samples up to `MAX_BATCH_SIZE`; the explicit batch URL does not mean a collection
+of independent prediction requests. One runtime retrieval and one backend predict
+call handle the entire tensor. Backend sample ordering is preserved. Different
+samples in a tensor must have the same shape and scalar category; integer and
+floating JSON numbers may mix for floating models. Multiple named tensors must
+share the same leading sample count.
+
+sklearn HTTP inputs are nonempty rectangular **2D finite numeric lists** of shape
+`[samples, features]`. Strings, nulls, booleans, ragged arrays, and scalars are
+rejected; this API does not expose every custom estimator input format. Returned
+numeric, boolean, or string label arrays are normalized without stringifying data.
+
+ONNX accepts a nonempty rectangular numeric/boolean list for a single input, or a
+mapping such as `{"X": [[1.0, 2.0]], "mask": [[true, false]]}`. Tensor ranks are
+1 through the configured maximum; rank-zero tensor HTTP inputs are not exposed.
+All graph input names are required. The existing loader enforces declared rank,
+fixed/symbolic shapes, and float32/float64/int32/int64/bool types. JSON lists carry
+no NumPy dtype tag: floating tensors use the loader's numeric conversion, while
+integer tensors reject fractions/overflow and boolean tensors reject numeric
+coercion. String tensors remain unsupported. Native callers passing NumPy arrays
+directly to a loaded runtime still follow Phase 3's stricter ndarray dtype rules;
+InferenceService itself accepts the documented JSON list/mapping contract.
+
+Outputs support NumPy arrays/scalars and nested lists/tuples, string-keyed objects,
+finite native numbers, strings, booleans, and null. ONNX output names are preserved
+as object keys. Complex values, arbitrary objects, bytes, non-string keys, and
+nonfinite floats raise a serialization error; oversized/nested outputs are
+rejected within the configured element/rank bounds. Normalization does not make
+arbitrary model execution memory-safe. `latency_ms` uses a monotonic clock and
+includes service validation, metadata/readiness/admission, possible loading,
+prediction, and normalization; it is not a pure backend timing metric.
+
+### Optional tensor contracts
+
+Existing schema metadata is opaque unless it contains an `inference` key. This
+small explicit contract is **not arbitrary JSON Schema**:
+
+```python
+input_schema = {"inference": {"shape": [None, 1], "dtype": "number"}}
+output_schema = {"inference": {"shape": [None], "dtype": "number"}}
+# Named tensors, for example ONNX outputs:
+output_schema = {"inference": {"tensors": {
+    "Y": {"shape": [None, 2], "dtype": "number"}
+}}}
+```
+
+Each tensor contract requires exactly `shape` and `dtype`. Shape is a list of
+nonnegative fixed dimensions or `None` wildcards, up to the rank bound. Dtype is
+`number`, `integer`, `boolean`, or `string`; `number` accepts integer JSON values.
+These are JSON scalar categories, not floating bit-width declarations. A named
+contract requires exactly `tensors` and an exact, nonempty name-to-contract map.
+Unknown contract keywords and malformed specifications are model configuration
+errors. Other metadata keys (including old `type`/`features` descriptions) remain
+uninterpreted. Output contracts apply after normalization to JSON lists, so empty
+lists cannot communicate unobserved trailing dimensions.
+
+Input mismatches return 422; unsupported contract configuration returns 503;
+output mismatches/serialization failures return 500. Actual estimator/graph
+validation still applies. sklearn ValueError/TypeError prediction failures are
+classified as input failures; the adapter cannot distinguish every custom
+estimator bug that uses those exception types. Other backend failures remain
+prediction failures with their original chained cause.
+
+### Admission consistency and failures
+
+The service verifies the model and REGISTERED version, validates inputs, and
+requires a RUNNING deployment for that exact version. It obtains the runtime once
+and runs the existing conservative readiness checker without a fabricated smoke
+prediction. It then freshly reads a candidate deployment and admits the request
+only if its identity, RUNNING status, and original revision still match. Another
+stable RUNNING deployment of the same version may admit it if an earlier candidate
+changed. This deterministic eligibility check does not route between versions.
+
+**Admission is the successful final snapshot read.** A stop committed before that
+read is rejected; a changed RUNNING revision (for example scaling) requires a new
+admission attempt and returns 409 if no stable candidate exists. Requests already
+admitted may finish after undeploy. No transaction or global lifecycle lock spans
+prediction, and this is not strict cross-process atomic execution admission or a
+lease. Concurrency tests cover stopping before admission, scaling during readiness,
+and completing an admitted prediction while later requests are rejected.
+
+Inference input/execution errors do not mutate deployment status. In particular,
+a bad client's feature matrix does not mark a shared deployment FAILED. Loading
+failure denies admission and returns 503; the deployment-health endpoint retains
+Phase 4's failure-recording/recovery behavior. Existing model-version deletion and
+manual runtime invalidation policies remain unchanged.
+
+Errors use a stable public envelope without exception text, filesystem paths,
+raw inputs, stack traces, or backend details:
+
+```json
+{"error": {"code": "model_unavailable", "message": "Model or supporting service is unavailable"}}
+```
+
+| Status | Meaning |
+| --- | --- |
+| 404 | Missing model, version, deployment, or route |
+| 409 | Known lifecycle/revision conflict |
+| 413 | Body exceeds the configured byte limit |
+| 422 | Malformed request, input structure, shape, dtype, or input contract mismatch |
+| 503 | No eligible deployment, unavailable runtime/backend, or invalid model contract |
+| 500 | Unexpected execution, unsupported output, or internal failure |
+
+Required identifiers in HTTP paths/version fields are nonblank and at most 200
+characters. Pydantic rejects extra body fields and non-string versions. ASGI
+middleware checks both declared Content-Length and actual received bytes before
+JSON parsing, including requests without a length header. It buffers at most the
+configured accepted body size (plus server-owned incoming chunks). Prediction
+endpoints accept JSON only, with no artifact/Pickle upload capability. Health
+liveness does not load models or claim every deployment is ready.
+
+The container defaults to **TRUST_SKLEARN_ARTIFACTS=false**. Enable it only after
+establishing trust in the artifact source/root; it is acknowledgement, not a
+sandbox or provenance verifier. All execution remains in-process. The API has no
+authentication, tenant isolation, production rate limiting, or worker isolation;
+those are outside this phase. Weighted routing, canaries, A/B testing, and routing
+rollback remain Phase 6 work.
+
 ## Current limitations
 
 - SQLite and filesystem operations are separate transactions. Compensating actions
@@ -471,9 +683,9 @@ Versions with no deployment history retain the original deletion behavior.
   Callers must invalidate affected entries or clear caches and coordinate any
   concurrent registry changes. Existing users of a detached runtime may finish.
 - Deployment currently means logical readiness in this application instance.
-  Remote/container orchestration, real replica workers, REST APIs, traffic routing,
+  Remote/container orchestration, real replica workers, weighted traffic routing,
   metrics, authentication, background workers, cloud adapters, and distributed
-  coordination are not implemented. The `api` package remains empty.
+  coordination are not implemented. REST endpoints cover prediction and health only.
 
 ## Domain conventions
 
@@ -496,7 +708,8 @@ Versions with no deployment history retain the original deletion behavior.
   latency must be finite. Zero replicas, zero latency, and zero individual
   routing weights are allowed where the other invariants hold.
 - Schema dictionaries have independent defaults. Schema contents are opaque
-  metadata; no schema language or schema validation is imposed yet.
+  metadata. Only the explicit Phase 5 `inference` tensor-contract namespace is
+  validated; this does not implement arbitrary JSON Schema.
 - Inference logs store request metadata and an optional input hash, never raw
   input payloads.
 
@@ -566,6 +779,11 @@ Explicit constructor values override environment defaults.
 | `DATABASE_URL` | `sqlite:///./model_serving.db` |
 | `MAX_UPLOAD_SIZE_BYTES` | `104857600` (100 MiB; positive integer) |
 | `RUNTIME_CACHE_MAX_SIZE` | `16` (positive integer; completed runtime entries) |
+| `MAX_REQUEST_BODY_BYTES` | `1048576` (1 MiB; HTTP bytes before JSON parsing) |
+| `MAX_BATCH_SIZE` | `128` (samples per tensor, both prediction endpoints) |
+| `MAX_TENSOR_DIMENSIONS` | `4` (tensor rank) |
+| `MAX_TENSOR_ELEMENTS` | `100000` (total scalar input/output budget) |
+| `TRUST_SKLEARN_ARTIFACTS` | `false` (`true`/`false`, case-insensitive) |
 
 The database URL and artifact directory configure the adapters when explicitly
 constructed. Importing configuration initializes no services. The upload-size

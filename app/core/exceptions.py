@@ -125,3 +125,19 @@ class DeploymentRecoveryError(DomainError):
 
 class ModelVersionInUseError(DomainError):
     """Deployment history references this version; deletion is prohibited."""
+
+
+class PredictionInputError(PredictionError):
+    """Input structure, values, tensor shape, or dtype are unsupported."""
+
+
+class PredictionSerializationError(PredictionError):
+    """Predictions cannot be represented by the supported JSON output contract."""
+
+
+class InferenceUnavailableError(DomainError):
+    """No eligible deployment or application-owned runtime is available."""
+
+
+class ModelContractError(DomainError):
+    """Opt-in inference schema metadata is invalid or unsupported."""

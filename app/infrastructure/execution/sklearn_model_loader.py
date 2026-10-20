@@ -7,7 +7,7 @@ from typing import Any
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_is_fitted
 
-from app.core.exceptions import ModelLoadingError, PredictionError, UntrustedArtifactError
+from app.core.exceptions import ModelLoadingError, PredictionError, PredictionInputError, UntrustedArtifactError
 from app.interfaces.model_loader import ModelLoader
 
 
@@ -27,6 +27,8 @@ class SklearnLoadedModel:
         try:
             with self._prediction_lock:
                 return self._estimator.predict(inputs)
+        except (ValueError, TypeError) as error:
+            raise PredictionInputError("Scikit-learn prediction input is invalid") from error
         except Exception as error:
             raise PredictionError("Scikit-learn prediction failed") from error
 

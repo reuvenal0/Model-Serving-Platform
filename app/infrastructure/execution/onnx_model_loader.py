@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
-from app.core.exceptions import ModelLoadingError, PredictionError
+from app.core.exceptions import ModelLoadingError, PredictionError, PredictionInputError
 from app.interfaces.model_loader import ModelLoader
 
 
@@ -59,18 +59,18 @@ class OnnxLoadedModel:
         dtype = _DTYPES[metadata.type]
         if isinstance(value, np.ndarray):
             if value.dtype != dtype:
-                raise PredictionError(f"Input {metadata.name!r} requires dtype {dtype}; received {value.dtype}")
+                raise PredictionInputError(f"Input {metadata.name!r} requires dtype {dtype}; received {value.dtype}")
             return value
         if not isinstance(value, (list, tuple)):
-            raise PredictionError(f"Input {metadata.name!r} must be a NumPy array or nested list/tuple")
+            raise PredictionInputError(f"Input {metadata.name!r} must be a NumPy array or nested list/tuple")
         array = np.asarray(value)
         allowed_kinds = "b" if dtype.kind == "b" else "iu" if dtype.kind in "iu" else "iuf"
         if array.dtype.kind not in allowed_kinds:
-            raise PredictionError(f"Input {metadata.name!r} cannot be converted from {array.dtype} to {dtype}")
+            raise PredictionInputError(f"Input {metadata.name!r} cannot be converted from {array.dtype} to {dtype}")
         if dtype.kind in "iu" and array.size:
             limits = np.iinfo(dtype)
             if array.min().item() < limits.min or array.max().item() > limits.max:
-                raise PredictionError(f"Input {metadata.name!r} exceeds the range of {dtype}")
+                raise PredictionInputError(f"Input {metadata.name!r} exceeds the range of {dtype}")
         with np.errstate(over="raise", invalid="raise"):
             return array.astype(dtype)
 
@@ -89,10 +89,10 @@ class OnnxLoadedModel:
             elif len(self.inputs) == 1:
                 values = {self.inputs[0].name: inputs}
             else:
-                raise PredictionError("Multiple ONNX inputs require a mapping by input name")
+                raise PredictionInputError("Multiple ONNX inputs require a mapping by input name")
             expected = {item.name for item in self.inputs}
             if set(values) != expected:
-                raise PredictionError(
+                raise PredictionInputError(
                     f"ONNX input names differ; missing={expected - set(values)!r}, "
                     f"unexpected={set(values) - expected!r}"
                 )
@@ -101,13 +101,13 @@ class OnnxLoadedModel:
             for metadata in self.inputs:
                 array = self._tensor(values[metadata.name], metadata)
                 if array.ndim != len(metadata.shape):
-                    raise PredictionError(f"Input {metadata.name!r} requires rank {len(metadata.shape)}")
+                    raise PredictionInputError(f"Input {metadata.name!r} requires rank {len(metadata.shape)}")
                 for actual, dimension in zip(array.shape, metadata.shape):
                     if isinstance(dimension, int) and actual != dimension:
-                        raise PredictionError(f"Input {metadata.name!r} requires dimension {dimension}; received {actual}")
+                        raise PredictionInputError(f"Input {metadata.name!r} requires dimension {dimension}; received {actual}")
                     if isinstance(dimension, str):
                         if dimension in symbols and symbols[dimension] != actual:
-                            raise PredictionError(f"Conflicting sizes for symbolic dimension {dimension!r}")
+                            raise PredictionInputError(f"Conflicting sizes for symbolic dimension {dimension!r}")
                         symbols[dimension] = actual
                 feed[metadata.name] = array
             names = [item.name for item in self.outputs]
@@ -116,6 +116,8 @@ class OnnxLoadedModel:
             return dict(zip(names, predictions))
         except PredictionError:
             raise
+        except (ValueError, TypeError, FloatingPointError, OverflowError) as error:
+            raise PredictionInputError("ONNX prediction input is invalid") from error
         except Exception as error:
             raise PredictionError("ONNX prediction failed") from error
 
