@@ -34,8 +34,11 @@ def source_copy(destination: Path) -> None:
     assert not (destination / "model_serving.db").exists()
     assert not (destination / "artifacts").exists()
     assert not (destination / ".venv").exists()
-    assert not list(destination.glob(".env*"))
-
+    assert not [
+    path
+    for path in destination.glob(".env*")
+    if path.name != ".env.example"
+    ]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
