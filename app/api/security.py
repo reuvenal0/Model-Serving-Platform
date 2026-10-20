@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 key_header = APIKeyHeader(
     name="X-API-Key",
     auto_error=False,
-    description="Loopback only. Operator key reads; administrator key also mutates routing.",
+    description="Loopback only. Operator key reads; administrator key also manages models, deployments and routing.",
 )
 
 

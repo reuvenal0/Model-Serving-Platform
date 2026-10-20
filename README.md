@@ -3,6 +3,72 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
+## Minimal management quickstart (Phase 8B.1)
+
+From the repository root in PowerShell, after installing `.[dev]` as described below:
+
+```powershell
+Copy-Item .env.example .env
+# Use the New-PlatformApiKey function in the API keys section below.
+$env:ADMIN_API_KEY = New-PlatformApiKey
+$env:OPERATOR_API_KEY = New-PlatformApiKey
+# Optional persistence in the Git-ignored file; these assignments print no keys.
+Add-Content .env "`nADMIN_API_KEY=$env:ADMIN_API_KEY`nOPERATOR_API_KEY=$env:OPERATOR_API_KEY"
+python -m scripts.run_local
+```
+
+The loopback-only local launcher optionally reads **only the current directory's
+`.env`** before constructing Settings. Process variables win. Missing files leave
+behavior unchanged. Values are literal `KEY=value` assignments (optional matching
+quotes), without shell execution, interpolation, or inline comments. Other Python
+entry points do not auto-load it. Keep `.env` private. Trust and Swagger remain
+disabled by default. Docker Compose independently reads `.env` for interpolation
+and credential passthrough; it does not use the Python loader or local data paths.
+Start Docker with `docker compose up --build --detach --wait`; its secure defaults
+and genuine container-local management boundary remain unchanged.
+
+In another shell with the same administrator environment, create a tiny ONNX ReLU
+model and use the local management API (no server filesystem paths are accepted):
+
+```powershell
+New-Item -ItemType Directory -Force .tmp | Out-Null
+python -c "import onnx; from onnx import helper as h, TensorProto as t; g=h.make_graph([h.make_node('Relu',['X'],['Y'])],'demo',[h.make_tensor_value_info('X',t.FLOAT,[None,1])],[h.make_tensor_value_info('Y',t.FLOAT,[None,1])]); onnx.save(h.make_model(g,opset_imports=[h.make_opsetid('',13)],ir_version=8),'.tmp/management-demo.onnx')"
+$headers = @{ 'X-API-Key' = $env:ADMIN_API_KEY }
+$url = 'http://127.0.0.1:8000'
+Invoke-RestMethod "$url/models" -Method Post -Headers $headers -ContentType application/json -Body '{"name":"management-demo"}'
+$version = @{ version='v1'; onnx_base64=[Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD/.tmp/management-demo.onnx")) } | ConvertTo-Json
+Invoke-RestMethod "$url/models/management-demo/versions" -Method Post -Headers $headers -ContentType application/json -Body $version
+Invoke-RestMethod "$url/deployments" -Method Post -Headers $headers -ContentType application/json -Body '{"model_name":"management-demo","version":"v1","deployment_id":"management-demo-v1","resources":{"cpu":1.0,"memory_mb":128}}'
+Invoke-RestMethod "$url/predict/management-demo" -Method Post -ContentType application/json -Body '{"version":"v1","inputs":[[4.0]]}'
+# predictions: { "Y": [[4.0]] }
+Invoke-RestMethod "$url/models/management-demo/versions" -Headers $headers
+Invoke-RestMethod "$url/deployments" -Headers $headers
+# Stop explicitly when desired:
+# Invoke-RestMethod "$url/deployments/management-demo-v1/stop" -Method Post -Headers $headers
+```
+
+Do not rerun creation against existing names expecting an overwrite: duplicates
+return 409. Registration accepts **ONNX-only base64 JSON**, optional `input_schema`
+and `output_schema` JSON objects, and a version. The existing whole-body limit
+(default 1 MiB, including base64 overhead) is enforced before parsing; decoded
+artifacts also obey `MAX_UPLOAD_SIZE_BYTES`. Registration validates metadata and
+stores bytes through ModelRegistry with its existing cleanup; graph load-readiness
+is checked on deployment. Schema metadata retains the existing inference-contract
+semantics, not arbitrary JSON Schema support. sklearn remains trusted **offline**
+registration only; uploaded bytes never select its Pickle loader. Use trusted
+ONNX models too: native execution remains inside the application process.
+
+GET `/models`, `/models/{name}/versions`, and `/deployments` accept operator or
+administrator keys. All POST management operations require administrator keys.
+Responses omit artifact locations. For Docker, **do not send management requests
+through the published host port**. Instead pipe the same JSON bodies to
+`docker compose exec -T api python -m scripts.ops_request /models --method POST --role admin --data-stdin`
+(and similarly the version/deployment paths). For example:
+`$version | docker compose exec -T api python -m scripts.ops_request /models/management-demo/versions --method POST --role admin --data-stdin`.
+Read using `docker compose exec -T api python -m scripts.ops_request /models --role operator`.
+The client takes keys from its environment without printing them. Ctrl+C stops the
+local launcher; `docker compose down` stops Docker while preserving its volumes.
+
 ## Phase 8B quickstart
 
 Prerequisites: Git and Docker Desktop with a Linux engine (Linux/amd64), or local

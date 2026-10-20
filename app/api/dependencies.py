@@ -11,6 +11,7 @@ from app.services.inference_service import InferenceService
 from app.services.routing_manager import RoutingManager
 from app.services.metrics_collector import MetricsCollector
 from app.services.runtime_resource_monitor import RuntimeResourceMonitor
+from app.services.model_registry import ModelRegistry
 
 
 async def get_container(request: Request) -> ServiceContainer:
@@ -24,6 +25,12 @@ async def get_inference_service(
     container: Annotated[ServiceContainer, Depends(get_container)],
 ) -> InferenceService:
     return container.inference_service
+
+
+def get_model_registry(
+    container: Annotated[ServiceContainer, Depends(get_container)],
+) -> ModelRegistry:
+    return container.model_registry
 
 
 def get_deployment_manager(

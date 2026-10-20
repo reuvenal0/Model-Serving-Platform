@@ -18,6 +18,7 @@ from app.api.middleware import RequestBodyLimitMiddleware, SanitizedErrorMiddlew
 from app.api.routers.inference import router
 from app.api.routers.routing import router as routing_router
 from app.api.routers.monitoring import router as monitoring_router
+from app.api.routers.management import router as management_router
 from app.config import Settings
 from app.core.container import ServiceContainer
 from app.core.exceptions import StartupRecoveryError
@@ -112,6 +113,7 @@ def create_app(
     app.include_router(router)
     app.include_router(routing_router)
     app.include_router(monitoring_router)
+    app.include_router(management_router)
 
     @app.get(
         "/openapi.json",
