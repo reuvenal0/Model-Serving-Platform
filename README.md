@@ -3,7 +3,7 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 7 - Monitoring, Inference Logging & Metrics
+## Current scope: Phase 7.5 - Runtime Recovery & Resource Safety
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
@@ -16,7 +16,8 @@ and the artifact subsystem are unchanged. Phase 5 adds explicit-version inferenc
 and a small FastAPI transport. Phase 6 adds deployment-aware weighted routing,
 canary allocations, revisioned routing persistence, and validated rollback. Phase 7
 adds persistent sanitized inference observations and windowed metrics through
-local monitoring endpoints.
+local monitoring endpoints. Phase 7.5 adds automatic startup reconciliation, bounded
+runtime artifact retrieval, and process/cache resource visibility.
 
 ```text
 ModelRegistry
@@ -421,8 +422,9 @@ Logical replica count (including zero) is not runtime-residency or capacity proo
 
 ### Startup reconciliation
 
-Call `manager.reconcile()` explicitly during **quiescent single-process startup,
-before accepting work**. It revalidates persisted RUNNING records against the
+FastAPI lifespan now calls reconciliation automatically during **quiescent
+single-process startup, before accepting work** (Phase 7.5). Standalone Python
+applications can still call `manager.reconcile()` explicitly. It revalidates persisted RUNNING records against the
 current runtime manager, marks interrupted DEPLOYING records FAILED, and leaves
 FAILED/STOPPED records inactive. It never automatically restarts them. A fresh
 process has an empty cache and must reload its RUNNING versions; no persisted
@@ -507,11 +509,11 @@ overridden with `app.dependency_overrides[get_inference_service]` or
 `get_deployment_manager`. Tests use temporary **file-backed** SQLite databases;
 the existing in-memory engine is not shared across the HTTP thread pool.
 
-No automatic startup reconciliation sweep mutates another process's deployment
-attempts. Operators may explicitly invoke Phase 4 reconciliation during quiescent
-single-process startup; each inference request independently validates runtime
-readiness and deployment revision even without a sweep. Persisted RUNNING alone
-is never used as verified readiness.
+Phase 7.5 lifespan startup runs reconciliation before exposing its container to
+requests. This requires a single quiescent lifecycle owner; do not start another
+application process against live deployment attempts. Each inference request still
+validates runtime readiness and deployment revision. Persisted RUNNING alone is
+never used as verified readiness.
 
 Lifespan ownership follows [FastAPI's lifecycle guidance](https://fastapi.tiangolo.com/advanced/events/).
 Routes use ordinary `def`, so blocking loading/prediction runs through FastAPI's
@@ -783,6 +785,7 @@ Explicit constructor values override environment defaults.
 | `DATABASE_URL` | `sqlite:///./model_serving.db` |
 | `MAX_UPLOAD_SIZE_BYTES` | `104857600` (100 MiB; positive integer) |
 | `RUNTIME_CACHE_MAX_SIZE` | `16` (positive integer; completed runtime entries) |
+| `MAX_RUNTIME_ARTIFACT_BYTES` | `104857600` (100 MiB; positive integer; runtime artifact retrieval) |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` (1 MiB; HTTP bytes before JSON parsing) |
 | `MAX_BATCH_SIZE` | `128` (samples per tensor, both prediction endpoints) |
 | `MAX_TENSOR_DIMENSIONS` | `4` (tensor rank) |
@@ -856,10 +859,10 @@ artifacts it is asked to load, so do not expose this development server or stora
 to untrusted writers. Matching training and serving dependencies are required.
 
 After restart, persisted RUNNING status alone does not prove readiness. FastAPI
-startup creates its container but does not automatically run the global
-`DeploymentManager.reconcile()` sweep. The live script's deployment health request
-invokes the existing targeted readiness check in the **server process**, lazily
-loading the demo runtime; subsequent predictions also check readiness and revisions.
+startup creates its container and automatically runs
+`DeploymentManager.reconcile()` before accepting requests. The live script's deployment health request
+invokes the existing targeted readiness check in the **server process**, reloading
+the demo runtime if evicted; subsequent predictions also check readiness and revisions.
 Use this check after each restart before treating the demo as ready. The seed
 performs its own targeted smoke check but its in-memory runtime does not survive
 exit. No global reconciliation is invoked by the seed, since that would inspect
@@ -1233,3 +1236,152 @@ change routing. No automated test writes to persistent development storage.
 
 Phase 8 hardening, Prometheus/Grafana, tracing, OpenTelemetry, brokers, authentication,
 automated canary decisions, autoscaling, and long-term archival remain out of scope.
+
+## Phase 7.5 recovery and resource safety
+
+### Startup ownership and recovery policy
+
+The FastAPI lifespan constructs the application-owned `ServiceContainer`, performs
+existing migrations, and runs the existing `DeploymentManager.reconcile()` in a
+worker thread **before startup completes or HTTP dependencies expose services**.
+Caller-injected containers also reconcile; their cleanup remains caller-owned.
+Overlapping lifespans on the same application instance are rejected. Concurrent
+startup calls sharing one container join one in-progress reconciliation through a
+future; its short bookkeeping lock is released before database/model work. Each
+subsequent sequential lifespan revalidates again, rather than trusting an old
+report. Explicit quiescent `manager.reconcile()` remains available to Python users.
+
+This is a **single application process / single lifecycle owner** MVP. Run:
+
+```powershell
+$env:TRUST_SKLEARN_ARTIFACTS = 'true' # Only for explicitly trusted sklearn storage
+python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Multiple independent Uvicorn workers, separate containers sharing lifecycle state,
+and concurrent seeding/deployment during startup are unsupported. The in-process
+application/container guards are not distributed synchronization and cannot detect
+or arbitrate every separately launched process. Stop other lifecycle writers before
+starting or explicitly reconciling the application. No distributed lease is claimed.
+
+Recovery checks current model/version registration, REGISTERED status, and artifact
+existence even when a caller-injected container already has a cached runtime.
+RUNNING deployments then use the existing load-readiness check. Fresh application
+containers have empty caches, so startup actually reads and deserializes their active
+versions; this is **not metadata-only recovery**. Normal startup does not invent
+prediction smoke inputs. Load readiness proves a loaded object with predict capability,
+not accuracy for every input, worker-process readiness, or external serving capacity.
+Logical replicas remain metadata; no independent workers or CPU/RAM quotas exist.
+
+| Situation | Startup policy |
+| --- | --- |
+| RUNNING, registered and available runtime | Revalidate; preserve RUNNING and its revision if unchanged |
+| Interrupted DEPLOYING | Compare-and-swap to FAILED; do not restart |
+| FAILED / STOPPED | Leave inactive; do not load historical models |
+| Missing/corrupt/oversized artifact, INVALID version, disabled sklearn trust | Record per-deployment failure, detach unavailable cached references where applicable, persist FAILED under revision guard, continue with other deployments |
+| Revision conflict / concurrent stop | Report isolated conflict; never overwrite newer lifecycle state |
+| Database open/migration/list failure, repository infrastructure failure, or non-conflict failure recording recovery state | Abort startup; owned resources close; no serving readiness is advertised |
+
+The API may start with some deployments unavailable. `/health` remains process
+liveness and does not claim all models are ready. The startup report contains explicit
+health observations and failures internally; it is not returned through a public API.
+Diagnostics use sanitized error codes and aggregate counts, never artifact paths,
+backend messages, or traces. Enable INFO logging for `app.core.container` to see
+`startup_reconciliation_complete` counts; deployment recovery failures emit ERROR
+`startup_deployment_recovery_failed`, and fatal startup emits ERROR
+`application_startup_failed`. Fatal ASGI startup exceptions suppress backend exception
+rendering. A completion count is not a claim that every deployment recovered.
+
+**Trust remains disabled by default.** Starting against persisted sklearn deployments
+without `TRUST_SKLEARN_ARTIFACTS=true` fails their loading and records FAILED; there is
+no silent trust override. Only enable this setting for private, explicitly trusted
+artifacts. Pickle remains capable of arbitrary code execution; byte limits are not a
+sandbox. After correcting a failure, create a new deployment through existing Python
+services rather than forcing FAILED or STOPPED back to RUNNING. No automatic repair
+of operator data, artifact overwrite, rollout, or recovery retry is performed.
+
+Startup scans deployment metadata and loads active versions sequentially. Cost scales
+with persisted records and loading costs; startup may be slow for many large models.
+The bounded LRU remains active throughout recovery, so successfully checked versions
+can be evicted before startup finishes. They need not all remain cached. Later requests
+reload on demand and repeat readiness and fresh deployment-revision admission checks.
+Reports are point-in-time observations, not a durable execution lease. Existing strict
+routing failure policy and best-effort inference monitoring remain unchanged.
+
+### Runtime artifact byte limit
+
+`MAX_RUNTIME_ARTIFACT_BYTES` defaults to **100 MiB** and must be a strictly positive
+integer. It is separate from the reserved upload limit. The container injects it into
+`ModelRuntimeManager`; direct callers can set `max_artifact_bytes`. Both sklearn and
+ONNX use the same guard before loader selection/deserialization.
+
+The narrow `ArtifactStorage.retrieve_limited(key, max_bytes=...)` extension preserves
+ordinary registry save/download/delete contracts. Local storage opens the validated
+artifact, checks the opened descriptor's size **before reading content**, then reads
+bounded chunks with at most one extra byte to detect growth. Races or understated
+file sizes cannot bypass the bounded read. The runtime manager independently checks
+returned bytes/type/length, so a faulty backend cannot feed oversized bytes to a loader.
+Exactly-at-limit artifacts are allowed. `ArtifactTooLargeError` is sanitized and uses
+the existing artifact-unavailable HTTP semantics (503). Artifacts and version metadata
+are not deleted or changed on rejection; deployment recovery may record FAILED.
+
+The base storage method provides a retrieve-then-check compatibility fallback for old
+adapters. It cannot bound memory before their retrieval: custom adapters must override
+it with safe pre-read/bounded behavior for the same protection as local storage.
+Changing a limit applies to new loads; it does not retrospectively resize an already
+loaded runtime. Registered artifacts are still assumed immutable and privately owned.
+
+This is a serialized-byte limit, **not a RAM limit**. Retrieved bytes, temporary copies,
+expanded estimators, native ONNX allocations, and predictions can consume much more
+memory. There is no per-model memory estimator, hard process limit, load timeout, or
+process isolation. In-flight loads for distinct versions are not globally byte-limited.
+
+### Cache and process memory visibility
+
+The existing cache remains bounded by **entry count**, with LRU eviction, per-key
+single-flight loading, independent key concurrency, and generation-safe invalidation.
+Recovery preflight failure detaches an unavailable cached runtime; references already
+held by callers remain usable. Eviction/invalidation never closes a runtime in use and
+does not promise immediate reclamation by Python or native libraries.
+
+`GET /runtime/resources` is a **local-development-only** operational endpoint, not an
+inference request or a deployment-readiness check. It returns:
+
+```json
+{"rss_bytes":195567616,"rss_available":true,"cache":{"hits":2,"misses":1,"waits":0,"loads":1,"load_failures":0,"evictions":0,"current_size":1,"max_size":16,"in_flight":0}}
+```
+
+Cache counters retain their existing lifetime semantics; clear does not reset them.
+`current_size` is completed cached runtimes, not resident bytes; `in_flight` counts
+tracked loads and excludes detached generations still held by callers. No model names,
+artifact paths, process IDs, command lines, or environment settings are exposed.
+This unauthenticated endpoint must not be exposed publicly.
+
+The injected `RuntimeResourceMonitor` uses a small standard-library platform probe:
+Windows reports current working-set bytes through `GetProcessMemoryInfo`; Linux reads
+resident pages from `/proc/self/statm` and multiplies by the system page size. Unsupported
+platforms or unavailable OS counters return `rss_bytes: null, rss_available: false`.
+Linux requires readable mounted procfs. Windows is verified natively in this environment;
+Linux parsing and unavailable-counter behavior are tested with deterministic fixtures.
+RSS is an approximate whole-process observation, including shared/native pages according
+to OS accounting, not peak RSS, per-model attribution, or enforced memory capacity.
+
+### Recovery demonstration and verification
+
+```powershell
+python -m examples.recovery_demo
+python -m pytest -q
+```
+
+The recovery demo uses temporary SQLite/artifacts, shuts down and recreates an owned
+application, verifies automatic recovery, runs a prediction, displays cache/RSS data,
+rejects a separate oversized artifact before deserialization, verifies artifact retention,
+and closes resources. Tests cover partial failures, trust settings, interrupted startup,
+revision conflicts, repeated/injected lifespans, readiness gating, metadata preservation,
+bounded reads during growth, faulty backends, and the unchanged LRU/single-flight races.
+Existing persistent development seeders, model artifacts, and operator routing remain
+unchanged. No new database schema migration is required for Phase 7.5.
+
+Phase 8 packaging, process workers/isolation, real replicas, autoscaling, distributed
+locking, memory-aware eviction, cloud infrastructure, and hard CPU/RAM limits are not
+implemented.

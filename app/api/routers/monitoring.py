@@ -6,12 +6,13 @@ from dataclasses import replace
 from fastapi import APIRouter, Depends, Query
 from pydantic import AwareDatetime
 
-from app.api.dependencies import get_metrics_collector
+from app.api.dependencies import get_metrics_collector, get_runtime_resource_monitor
 from app.api.routers.inference import ModelName
 from app.api.schemas.inference import ErrorResponse
-from app.api.schemas.monitoring import InferenceLogResponse, LogPageResponse, MetricsResponse
+from app.api.schemas.monitoring import InferenceLogResponse, LogPageResponse, MetricsResponse, RuntimeResourcesResponse
 from app.interfaces.inference_log_repository import MAX_LOG_CURSOR, LogFilters
 from app.services.metrics_collector import MetricsCollector
+from app.services.runtime_resource_monitor import RuntimeResourceMonitor
 
 router = APIRouter(responses={status: {"model": ErrorResponse} for status in (422, 500, 503)})
 Collector = Annotated[MetricsCollector, Depends(get_metrics_collector)]
@@ -55,3 +56,11 @@ def inference_logs(collector: Collector, filters: Filters,
         latency_ms=log.latency_ms, success=log.success, error_code=log.error_message,
         timestamp=log.timestamp,
     ) for log in page.logs], next_cursor=page.next_cursor, start=page.start, end=page.end)
+
+
+@router.get('/runtime/resources', response_model=RuntimeResourcesResponse)
+def runtime_resources(
+    monitor: Annotated[RuntimeResourceMonitor, Depends(get_runtime_resource_monitor)],
+) -> RuntimeResourcesResponse:
+    """Local-development-only process RSS and cache counters; no model metadata."""
+    return RuntimeResourcesResponse.model_validate(monitor.snapshot())

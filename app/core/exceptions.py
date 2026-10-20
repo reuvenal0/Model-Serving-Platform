@@ -161,3 +161,11 @@ class RoutingUnavailableError(InferenceUnavailableError):
 
 class DuplicateInferenceLogError(DomainError):
     """An observation ID was already recorded; existing data was preserved."""
+
+
+class ArtifactTooLargeError(ArtifactStorageError):
+    """Artifact bytes exceed the configured runtime loading limit."""
+
+
+class StartupRecoveryError(DomainError):
+    """Infrastructure startup/reconciliation failed; serving cannot begin."""

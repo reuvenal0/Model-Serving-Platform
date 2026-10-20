@@ -35,3 +35,23 @@ class LogPageResponse(BaseModel):
     next_cursor: int | None
     start: AwareDatetime
     end: AwareDatetime
+
+
+class RuntimeCacheResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    hits: int
+    misses: int
+    waits: int
+    loads: int
+    load_failures: int
+    evictions: int
+    current_size: int
+    max_size: int
+    in_flight: int
+
+
+class RuntimeResourcesResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    rss_bytes: int | None = Field(ge=0)
+    rss_available: bool
+    cache: RuntimeCacheResponse

@@ -5,7 +5,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Lock
 
-from app.core.exceptions import DomainValidationError, ModelLoadingError
+from app.core.exceptions import ArtifactNotFoundError, ArtifactStorageError, ArtifactTooLargeError, DomainValidationError, ModelLoadingError
 from app.domain._validation import nonempty
 from app.domain.enums import ModelVersionStatus
 from app.interfaces.artifact_storage import ArtifactStorage
@@ -42,13 +42,17 @@ class ModelRuntimeManager:
     def __init__(
         self, repository: ModelRepository, storage: ArtifactStorage,
         loaders: ModelLoaderRegistry, *, max_cache_size: int = 16,
+        max_artifact_bytes: int = 100 * 1024 * 1024,
     ) -> None:
         if type(max_cache_size) is not int or max_cache_size <= 0:
             raise DomainValidationError("max_cache_size must be a strictly positive integer")
+        if type(max_artifact_bytes) is not int or max_artifact_bytes <= 0:
+            raise DomainValidationError("max_artifact_bytes must be a strictly positive integer")
         self._repository = repository
         self._storage = storage
         self._loaders = loaders
         self._max_cache_size = max_cache_size
+        self._max_artifact_bytes = max_artifact_bytes
         self._cache: OrderedDict[tuple[str, str], LoadedModel] = OrderedDict()
         self._loading: dict[tuple[str, str], Future[LoadedModel]] = {}
         self._lock = Lock()
@@ -59,12 +63,30 @@ class ModelRuntimeManager:
         metadata = self._repository.get_version(model_name, version)
         if metadata.status is not ModelVersionStatus.REGISTERED:
             raise ModelLoadingError("Only REGISTERED model versions can be loaded")
-        artifact = self._storage.retrieve(metadata.artifact_location)
+        artifact = self._storage.retrieve_limited(metadata.artifact_location, max_bytes=self._max_artifact_bytes)
+        # Independent guard: a racing or faulty backend must not bypass the cap.
+        if not isinstance(artifact, bytes):
+            raise ArtifactStorageError("Artifact backend did not return bytes")
+        if len(artifact) > self._max_artifact_bytes:
+            raise ArtifactTooLargeError("Artifact exceeds maximum runtime loading size")
         loader = self._loaders.get_loader(metadata.framework)
         runtime = loader.load(artifact)
         if not callable(getattr(runtime, "predict", None)):
             raise ModelLoadingError("Loader returned a runtime without predict()")
         return runtime
+
+    def verify_available(self, model_name: str, version: str) -> None:
+        """Recovery preflight even for a cached runtime; no deserialization.
+
+        This checks registry state and artifact existence, not artifact integrity
+        or prediction accuracy. Actual cache misses use bounded load-readiness.
+        """
+        self._repository.get_model(model_name)
+        metadata = self._repository.get_version(model_name, version)
+        if metadata.status is not ModelVersionStatus.REGISTERED:
+            raise ModelLoadingError("Only REGISTERED model versions can be loaded")
+        if not self._storage.exists(metadata.artifact_location):
+            raise ArtifactNotFoundError("Runtime artifact does not exist")
 
     def get_runtime(self, model_name: str, version: str) -> LoadedModel:
         nonempty(model_name, "model_name")

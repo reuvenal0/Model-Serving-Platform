@@ -35,6 +35,7 @@ def dependencies():
     )
     storage = Mock(spec=ArtifactStorage)
     storage.retrieve.side_effect = lambda key: key.encode()
+    storage.retrieve_limited.side_effect = lambda key, *, max_bytes: storage.retrieve(key)
     loader = Mock(spec=ModelLoader)
     loader.load.side_effect = Runtime
     loaders = ModelLoaderRegistry({ModelFramework.ONNX: loader})

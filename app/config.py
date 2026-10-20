@@ -46,12 +46,17 @@ class Settings:
     trust_sklearn_artifacts: bool = field(
         default_factory=lambda: _env_bool("TRUST_SKLEARN_ARTIFACTS")
     )
+    max_runtime_artifact_bytes: int = field(
+        default_factory=lambda: int(os.getenv("MAX_RUNTIME_ARTIFACT_BYTES", str(100 * 1024 * 1024)))
+    )
 
     def __post_init__(self) -> None:
         if type(self.max_upload_size_bytes) is not int or self.max_upload_size_bytes <= 0:
             raise ValueError("max_upload_size_bytes must be a strictly positive integer")
         if type(self.runtime_cache_max_size) is not int or self.runtime_cache_max_size <= 0:
             raise ValueError("runtime_cache_max_size must be a strictly positive integer")
+        if type(self.max_runtime_artifact_bytes) is not int or self.max_runtime_artifact_bytes <= 0:
+            raise ValueError("max_runtime_artifact_bytes must be a strictly positive integer")
         for name in ("max_request_body_bytes", "max_batch_size", "max_tensor_dimensions", "max_tensor_elements"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:

@@ -165,6 +165,12 @@ class DeploymentManager:
             deployment = snapshot.deployment
             try:
                 if deployment.status is DeploymentStatus.RUNNING:
+                    try:
+                        self._runtimes.verify_available(deployment.model_name, deployment.version)
+                    except Exception as error:
+                        self._runtimes.invalidate(deployment.model_name, deployment.version)
+                        self._record_failure(snapshot, error)
+                        raise
                     health.append(self.check_health(deployment.id))
                 elif deployment.status is DeploymentStatus.DEPLOYING:
                     interrupted = replace(deployment)

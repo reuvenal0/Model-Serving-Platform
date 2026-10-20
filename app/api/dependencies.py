@@ -10,6 +10,7 @@ from app.services.deployment_manager import DeploymentManager
 from app.services.inference_service import InferenceService
 from app.services.routing_manager import RoutingManager
 from app.services.metrics_collector import MetricsCollector
+from app.services.runtime_resource_monitor import RuntimeResourceMonitor
 
 
 def get_container(request: Request) -> ServiceContainer:
@@ -41,3 +42,9 @@ def get_metrics_collector(
     container: Annotated[ServiceContainer, Depends(get_container)],
 ) -> MetricsCollector:
     return container.metrics_collector
+
+
+def get_runtime_resource_monitor(
+    container: Annotated[ServiceContainer, Depends(get_container)],
+) -> RuntimeResourceMonitor:
+    return container.resource_monitor

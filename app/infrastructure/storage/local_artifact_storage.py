@@ -8,7 +8,7 @@ import stat
 import tempfile
 
 from app.core.exceptions import (
-    ArtifactCleanupError, ArtifactNotFoundError, ArtifactStorageError,
+    ArtifactCleanupError, ArtifactNotFoundError, ArtifactStorageError, ArtifactTooLargeError,
     DomainValidationError, DuplicateArtifactError,
 )
 from app.interfaces.artifact_storage import ArtifactStorage
@@ -111,6 +111,29 @@ class LocalArtifactStorage(ArtifactStorage):
             raise ArtifactNotFoundError(f"Artifact {key!r} does not exist") from error
         except OSError as error:
             raise ArtifactStorageError(f"Could not delete artifact {key!r}") from error
+
+    def retrieve_limited(self, key: str, *, max_bytes: int) -> bytes:
+        self._validate_limit(max_bytes)
+        try:
+            with self._path(key).open("rb") as stream:
+                # Inspect the opened file, not a separate path lookup which may
+                # refer to a different file after concurrent replacement.
+                if os.fstat(stream.fileno()).st_size > max_bytes:
+                    raise ArtifactTooLargeError("Artifact exceeds maximum runtime loading size")
+                chunks = []
+                total = 0
+                while True:
+                    chunk = stream.read(min(64 * 1024, max_bytes - total + 1))
+                    if not chunk:
+                        return b"".join(chunks)
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ArtifactTooLargeError("Artifact exceeds maximum runtime loading size")
+                    chunks.append(chunk)
+        except FileNotFoundError as error:
+            raise ArtifactNotFoundError("Runtime artifact does not exist") from error
+        except OSError as error:
+            raise ArtifactStorageError("Could not read runtime artifact") from error
 
     def exists(self, key: str) -> bool:
         try:
