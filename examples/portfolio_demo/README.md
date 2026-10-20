@@ -34,9 +34,9 @@ docker compose -p portfolio-onnx exec -T api python -m examples.portfolio_demo.d
 Matching identities, schemas (including bundled artifact SHA-256), deployment
 resources and RUNNING states are reused. Artifacts are never overwritten.
 Mismatched identities, stopped/failed deployments or non-demo routing allocations
-cause a clear failure; there is no silent repair. Existing artifact bytes cannot
-be downloaded through management APIs; setup compares their recorded fingerprint
-and metadata, while the run verifies predictions. Use these reserved names only
+cause a clear failure; there is no silent repair. Setup compares recorded artifact
+fingerprints and metadata rather than downloading existing bytes; the run verifies
+predictions. The management API separately supports artifact downloads. Use these reserved names only
 for this demo. The isolated project must not override `CONTAINER_DATABASE_URL`
 or `CONTAINER_ARTIFACT_STORAGE_DIR` to point at other data.
 
