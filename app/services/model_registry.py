@@ -5,7 +5,8 @@ from typing import Any
 from uuid import uuid4
 
 from app.core.exceptions import (
-    ArtifactCleanupError, DomainValidationError, DuplicateModelError,
+    ArtifactCleanupError, ArtifactStorageError, ArtifactTooLargeError,
+    DomainValidationError, DuplicateModelError,
     DuplicateVersionError, ModelNotFoundError, ModelVersionNotFoundError,
     RegistryConsistencyError,
 )
@@ -107,16 +108,28 @@ class ModelRegistry:
     def get_version(self, model_name: str, version: str) -> ModelVersion:
         return self._repository.get_version(model_name, version)
 
-    def download_artifact(self, model_name: str, version: str) -> bytes:
+    def download_artifact(
+        self, model_name: str, version: str, *, max_bytes: int | None = None,
+    ) -> bytes:
+        """Return bytes; HTTP callers supply a cap using existing bounded storage."""
         metadata = self._repository.get_version(model_name, version)
-        return self._storage.retrieve(metadata.artifact_location)
+        if max_bytes is None:
+            return self._storage.retrieve(metadata.artifact_location)
+        content = self._storage.retrieve_limited(metadata.artifact_location, max_bytes=max_bytes)
+        # Independent check protects callers against an inconsistent adapter.
+        if not isinstance(content, bytes):
+            raise ArtifactStorageError("Artifact backend did not return bytes")
+        if len(content) > max_bytes:
+            raise ArtifactTooLargeError("Artifact exceeds maximum download size")
+        return content
 
     def delete_version(self, model_name: str, version: str) -> None:
         """Commit metadata deletion before removing bytes; never delete the parent.
 
         A metadata failure leaves bytes alone. A subsequent artifact failure
         reports an orphan key for explicit storage cleanup, including a missing
-        artifact that indicates prior inconsistency. No deployment checks exist.
+        artifact that indicates prior inconsistency. Repository guards protect
+        versions referenced by deployment and routing history.
         """
         self._repository.get_version(model_name, version)
         # Use the snapshot actually removed by the repository, not an earlier read.

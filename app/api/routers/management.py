@@ -4,14 +4,15 @@ import base64
 import binascii
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.api.dependencies import get_deployment_manager, get_model_registry
 from app.api.schemas.management import (
     DeploymentRequest, DeploymentResponse, ModelRequest, ModelResponse,
-    VersionRequest, VersionResponse,
+    ScaleRequest, VersionRequest, VersionResponse,
 )
 from app.api.security import require_admin, require_operator
+from app.core.exceptions import ArtifactNotFoundError, ArtifactTooLargeError
 from app.domain.enums import ModelFramework
 from app.domain.resource_config import ResourceConfig
 from app.services.deployment_manager import DeploymentManager
@@ -63,6 +64,31 @@ def register_version(name: str, body: VersionRequest, request: Request, registry
     )
 
 
+@router.get("/models/{name}/versions/{version}/artifact", response_class=Response,
+            responses={200: {"content": {"application/octet-stream": {}}}})
+def download_artifact(name: str, version: str, request: Request, registry: Registry):
+    try:
+        content = registry.download_artifact(
+            name, version,
+            max_bytes=request.app.state.security_settings.max_runtime_artifact_bytes,
+        )
+    except ArtifactNotFoundError:
+        raise HTTPException(404) from None
+    except ArtifactTooLargeError:
+        raise HTTPException(413) from None
+    return Response(content, media_type="application/octet-stream", headers={
+        "Content-Disposition": 'attachment; filename="model-artifact.bin"',
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
+    })
+
+
+@router.delete("/models/{name}/versions/{version}", status_code=204,
+               dependencies=[Depends(require_admin)])
+def delete_version(name: str, version: str, registry: Registry) -> Response:
+    registry.delete_version(name, version)
+    return Response(status_code=204)
+
+
 @router.post("/deployments", response_model=DeploymentResponse, status_code=201,
              dependencies=[Depends(require_admin)])
 def deploy(body: DeploymentRequest, manager: Manager):
@@ -82,3 +108,10 @@ def list_deployments(manager: Manager):
              dependencies=[Depends(require_admin)])
 def stop(deployment_id: str, manager: Manager):
     return manager.undeploy(deployment_id)
+
+
+@router.post("/deployments/{deployment_id}/scale", response_model=DeploymentResponse,
+             dependencies=[Depends(require_admin)])
+def scale(deployment_id: str, body: ScaleRequest, manager: Manager):
+    """Update logical replicas only; no processes or containers are created."""
+    return manager.scale(deployment_id, body.replicas)

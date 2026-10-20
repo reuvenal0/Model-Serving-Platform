@@ -65,3 +65,8 @@ class DeploymentResponse(BaseModel):
     status: DeploymentStatus
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+class ScaleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    replicas: int = Field(ge=0)
