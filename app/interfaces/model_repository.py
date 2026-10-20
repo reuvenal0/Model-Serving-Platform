@@ -45,6 +45,6 @@ class ModelRepository(ABC):
     def delete_version(self, model_name: str, version: str) -> ModelVersion:
         """Delete and return a snapshot, preserving the parent model.
 
-        ModelVersionInUseError protects versions referenced by deployment history.
+        ModelVersionInUseError protects versions referenced by deployment or routing history.
         The backend must enforce this atomically with deletion, not via prechecks.
         """

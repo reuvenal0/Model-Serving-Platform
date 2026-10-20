@@ -87,3 +87,40 @@ class DeploymentRecord(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     revision: Mapped[int] = mapped_column(nullable=False)
+
+
+class RoutingCurrentRecord(Base):
+    __tablename__ = "routing_current"
+    __table_args__ = (CheckConstraint("revision >= 1"),)
+
+    model_name: Mapped[str] = mapped_column(ForeignKey("models.name", ondelete="RESTRICT"), primary_key=True)
+    weights: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    revision: Mapped[int] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    restored_from: Mapped[int | None] = mapped_column(nullable=True)
+
+
+class RoutingHistoryRecord(Base):
+    __tablename__ = "routing_history"
+    __table_args__ = (CheckConstraint("revision >= 1"),)
+
+    model_name: Mapped[str] = mapped_column(ForeignKey("models.name", ondelete="RESTRICT"), primary_key=True)
+    revision: Mapped[int] = mapped_column(primary_key=True)
+    weights: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    restored_from: Mapped[int | None] = mapped_column(nullable=True)
+
+
+class RoutingVersionReferenceRecord(Base):
+    """Normalized historical references enforce artifact-retention safety."""
+
+    __tablename__ = "routing_version_references"
+    __table_args__ = (
+        ForeignKeyConstraint(["model_name", "revision"],
+                             ["routing_history.model_name", "routing_history.revision"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(["model_name", "version"],
+                             ["model_versions.model_name", "model_versions.version"], ondelete="RESTRICT"),
+    )
+    model_name: Mapped[str] = mapped_column(String, primary_key=True)
+    revision: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[str] = mapped_column(String, primary_key=True)

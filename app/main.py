@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.errors import install_exception_handlers
 from app.api.middleware import RequestBodyLimitMiddleware
 from app.api.routers.inference import router
+from app.api.routers.routing import router as routing_router
 from app.config import Settings
 from app.core.container import ServiceContainer
 
@@ -35,4 +36,5 @@ def create_app(
     app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=selected.max_request_body_bytes)
     install_exception_handlers(app)
     app.include_router(router)
+    app.include_router(routing_router)
     return app

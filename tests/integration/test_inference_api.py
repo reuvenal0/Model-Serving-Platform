@@ -86,7 +86,7 @@ def test_batch_preserves_sample_order_in_one_runtime_call(client, deployed, monk
     prediction.assert_called_once_with([[4], [3], [0]])
 
 
-@pytest.mark.parametrize("body", [{}, {"inputs": [[3]]}, {"version": 1, "inputs": [[3]]},
+@pytest.mark.parametrize("body", [{}, {"version": "", "inputs": [[3]]}, {"version": 1, "inputs": [[3]]},
                                     {"version": " ", "inputs": [[3]]},
                                     {"version": "v1", "inputs": "bytes"},
                                     {"version": "v1", "inputs": [[3]], "extra": True},
@@ -342,10 +342,10 @@ def test_onnx_integer_dtype_rejects_fractional_json_numbers(container):
         assert client.post("/predict/integers", json={"version": "v1", "inputs": [[2]]}).json()["predictions"] == {"Y": [[2]]}
 
 
-def test_openapi_describes_explicit_version_and_structured_errors(client):
+def test_openapi_describes_optional_version_and_structured_errors(client):
     spec = client.get("/openapi.json").json()
     request = spec["components"]["schemas"]["PredictionRequest"]
-    assert set(request["required"]) == {"version", "inputs"}
+    assert set(request["required"]) == {"inputs"}
     errors = spec["paths"]["/predict/{model_name}"]["post"]["responses"]
     assert errors["422"]["content"]["application/json"]["schema"]["$ref"].endswith("ErrorResponse")
 

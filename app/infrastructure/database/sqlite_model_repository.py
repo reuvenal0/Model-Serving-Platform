@@ -139,6 +139,6 @@ class SQLiteModelRepository(ModelRepository):
             # SQLite RESTRICT can use CONSTRAINT_TRIGGER rather than FOREIGNKEY.
             if "FOREIGN KEY constraint failed" in str(error.orig):
                 raise ModelVersionInUseError(
-                    f"Version {model_name!r}/{version!r} is referenced by deployment history"
+                    f"Version {model_name!r}/{version!r} is referenced by deployment or routing history"
                 ) from error
             raise RepositoryError("Could not delete version") from error

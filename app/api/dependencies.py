@@ -8,6 +8,7 @@ from app.core.container import ServiceContainer
 from app.core.exceptions import InferenceUnavailableError
 from app.services.deployment_manager import DeploymentManager
 from app.services.inference_service import InferenceService
+from app.services.routing_manager import RoutingManager
 
 
 def get_container(request: Request) -> ServiceContainer:
@@ -27,3 +28,9 @@ def get_deployment_manager(
     container: Annotated[ServiceContainer, Depends(get_container)],
 ) -> DeploymentManager:
     return container.deployment_manager
+
+
+def get_routing_manager(
+    container: Annotated[ServiceContainer, Depends(get_container)],
+) -> RoutingManager:
+    return container.routing_manager

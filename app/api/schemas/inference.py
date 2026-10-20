@@ -10,13 +10,13 @@ from app.domain.enums import DeploymentStatus
 class PredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    version: str = Field(min_length=1, max_length=200)
+    version: str | None = Field(default=None, min_length=1, max_length=200)
     inputs: list[JsonValue] | dict[str, list[JsonValue]]
 
     @field_validator("version")
     @classmethod
-    def nonblank_version(cls, value: str) -> str:
-        if not value.strip():
+    def nonblank_version(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("Version cannot be blank")
         return value
 

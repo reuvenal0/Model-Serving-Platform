@@ -7,6 +7,7 @@ from app.domain.enums import ModelFramework
 from app.infrastructure.database.database import create_sqlite_engine, initialize_database
 from app.infrastructure.database.sqlite_deployment_repository import SQLiteDeploymentRepository
 from app.infrastructure.database.sqlite_model_repository import SQLiteModelRepository
+from app.infrastructure.database.sqlite_routing_repository import SQLiteRoutingRepository
 from app.infrastructure.execution.onnx_model_loader import OnnxModelLoader
 from app.infrastructure.execution.sklearn_model_loader import SklearnModelLoader
 from app.infrastructure.storage.local_artifact_storage import LocalArtifactStorage
@@ -16,6 +17,10 @@ from app.services.inference_service import InferenceService
 from app.services.model_loader_registry import ModelLoaderRegistry
 from app.services.model_registry import ModelRegistry
 from app.services.model_runtime_manager import ModelRuntimeManager
+from app.services.routing_manager import RoutingManager
+from app.services.traffic_router import TrafficRouter
+from app.services.weighted_random_strategy import WeightedRandomStrategy
+from app.interfaces.routing_strategy import RoutingStrategy
 
 
 class ServiceContainer:
@@ -26,7 +31,7 @@ class ServiceContainer:
     HTTP thread pool; the existing in-memory engine is connection/thread-local.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, routing_strategy: RoutingStrategy | None = None) -> None:
         self.settings = settings
         self._closed = False
         self.engine = create_sqlite_engine(settings.database_url)
@@ -35,6 +40,7 @@ class ServiceContainer:
             self.session_factory = sessionmaker(self.engine)
             self.model_repository = SQLiteModelRepository(self.session_factory)
             self.deployment_repository = SQLiteDeploymentRepository(self.session_factory)
+            self.routing_repository = SQLiteRoutingRepository(self.session_factory)
             self.artifact_storage = LocalArtifactStorage(settings.artifact_storage_dir)
             self.model_registry = ModelRegistry(self.model_repository, self.artifact_storage)
             self.loader_registry = ModelLoaderRegistry({
@@ -50,12 +56,22 @@ class ServiceContainer:
                 self.deployment_repository, self.model_repository,
                 self.runtime_manager, self.health_checker,
             )
+            self.routing_strategy = routing_strategy if routing_strategy is not None else WeightedRandomStrategy()
+            self.routing_manager = RoutingManager(
+                self.routing_repository, self.model_repository,
+                self.deployment_repository, self.deployment_manager,
+            )
+            self.traffic_router = TrafficRouter(
+                self.routing_repository, self.model_repository,
+                self.deployment_repository, self.routing_strategy,
+            )
             self.inference_service = InferenceService(
                 self.model_repository, self.deployment_repository,
                 self.runtime_manager, self.health_checker,
                 max_batch_size=settings.max_batch_size,
                 max_tensor_dimensions=settings.max_tensor_dimensions,
                 max_tensor_elements=settings.max_tensor_elements,
+                traffic_router=self.traffic_router,
             )
         except BaseException:
             self.engine.dispose()

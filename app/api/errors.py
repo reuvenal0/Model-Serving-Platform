@@ -15,6 +15,9 @@ def error_response(status: int, code: str, message: str) -> JSONResponse:
 
 
 _MAPPINGS = (
+    ((errors.RoutingNotFoundError, errors.RoutingHistoryNotFoundError),
+     404, "routing_not_found", "Requested routing configuration or revision was not found"),
+    ((errors.RoutingConflictError,), 409, "routing_conflict", "Routing revision changed; read it before retrying"),
     ((errors.PredictionInputError, errors.DomainValidationError), 422, "invalid_input", "Prediction input is invalid"),
     ((errors.ModelNotFoundError, errors.ModelVersionNotFoundError, errors.DeploymentNotFoundError),
      404, "not_found", "Requested model, version, or deployment was not found"),

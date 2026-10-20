@@ -3,7 +3,7 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 5 - Inference Service & REST API
+## Current scope: Phase 6 - Traffic Routing, Canary Releases & Rollback
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
@@ -13,8 +13,8 @@ in-process prediction, and lazy, thread-safe runtime caching. Phase 4 adds persi
 logical deployments, guarded lifecycle orchestration, conservative readiness,
 startup reconciliation, and deployment-aware deletion safety. Domain invariants
 and the artifact subsystem are unchanged. Phase 5 adds explicit-version inference
-and a small FastAPI transport. Weighted routing, canary releases, A/B testing, and
-routing rollback remain reserved for Phase 6.
+and a small FastAPI transport. Phase 6 adds deployment-aware weighted routing,
+canary allocations, revisioned routing persistence, and validated rollback.
 
 ```text
 ModelRegistry
@@ -347,9 +347,9 @@ The setup follows SQLAlchemy's [composite foreign-key guidance](https://docs.sql
 and [SQLite concurrency documentation](https://docs.sqlalchemy.org/en/20/dialects/sqlite.html).
 
 `initialize_database()` creates missing tables, including the new deployment table,
-without altering existing ones. It is not a migration system. Existing databases
-with incompatible layouts require an explicit migration before use; schema
-versions, data backfills, and ALTER TABLE migration automation are not implemented.
+without altering existing ones. Phase 6 additionally runs the numbered routing
+migration described below. Incompatible legacy layouts still require explicit
+operator migration; no general ALTER TABLE/backfill automation is provided.
 
 ### Lifecycle orchestration and failures
 
@@ -488,10 +488,10 @@ python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
 Swagger documentation is at `/docs`; `/openapi.json` includes the request,
-response, and structured error schemas. Versions are always explicit; there is no
-implicit latest version or traffic split. Register/deploy models through Python
-services (see the API demo); registration, upload, deployment mutation, and routing
-REST endpoints are outside Phase 5.
+response, and structured error schemas. Explicit versions preserve the Phase 5
+behavior; Phase 6 also permits omitted versions using configured weighted routing.
+Register/deploy models through Python services (see the API demo); registration,
+upload, and deployment mutation REST endpoints remain outside the current scope.
 
 Importing `app.main` and calling `create_app(settings)` allocate no application
 graph or database/storage resources. Lifespan startup constructs an owned
@@ -523,7 +523,7 @@ or process isolation. Servers must drain requests before closing owned resources
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| POST | `/predict/{model_name}` | One vectorized call using the explicit version |
+| POST | `/predict/{model_name}` | One vectorized call using an explicit or routed version |
 | POST | `/predict/{model_name}/batch` | Explicit alias for the same bounded batched-tensor call |
 | GET | `/health` | API process liveness only: `{"status":"ok"}` |
 | GET | `/deployments/{deployment_id}/health` | Existing load-readiness check and lifecycle state |
@@ -656,8 +656,8 @@ The container defaults to **TRUST_SKLEARN_ARTIFACTS=false**. Enable it only afte
 establishing trust in the artifact source/root; it is acknowledgement, not a
 sandbox or provenance verifier. All execution remains in-process. The API has no
 authentication, tenant isolation, production rate limiting, or worker isolation;
-those are outside this phase. Weighted routing, canaries, A/B testing, and routing
-rollback remain Phase 6 work.
+those are outside this phase. Phase 6 routing management endpoints are strictly
+for local development until authorization and authentication are implemented.
 
 ## Current limitations
 
@@ -668,11 +668,13 @@ rollback remain Phase 6 work.
 - Individual repository operations and artifact publication are atomic, but the
   full registry workflow is not isolated across backends. Concurrent downloads
   can observe deletion, and complex concurrent workflows need caller coordination.
-- Schema initialization creates missing tables; migrations are not implemented.
+- Legacy tables retain their initialization behavior; a numbered additive migration
+  installs routing tables. General schema evolution/backfill tooling is not implemented.
 - Artifacts use an in-memory bytes API. Streaming and configured upload-size
   enforcement are not implemented. POSIX storage requires hard-link support.
 - Deployment history prevents version deletion even after stopping. No history
-  archival/purge policy is implemented.
+  archival/purge policy is implemented. Routing history also retains version references,
+  including zero-weight versions, and blocks deletion without controlled history cleanup.
 - Model loading and prediction run inside the application process, with no worker
   subprocess, process isolation, timeout, cancellation, or resource enforcement.
   A bad artifact/backend can exhaust resources or crash the process.
@@ -683,9 +685,9 @@ rollback remain Phase 6 work.
   Callers must invalidate affected entries or clear caches and coordinate any
   concurrent registry changes. Existing users of a detached runtime may finish.
 - Deployment currently means logical readiness in this application instance.
-  Remote/container orchestration, real replica workers, weighted traffic routing,
-  metrics, authentication, background workers, cloud adapters, and distributed
-  coordination are not implemented. REST endpoints cover prediction and health only.
+  Remote/container orchestration, real replica workers, metrics, authentication,
+  background workers, cloud adapters, and distributed coordination are not implemented.
+  REST endpoints cover prediction, health, and local routing management.
 
 ## Domain conventions
 
@@ -862,3 +864,174 @@ exit. No global reconciliation is invoked by the seed, since that would inspect
 and potentially load unrelated deployments. The existing explicit global reconcile
 procedure is reserved for a quiescent startup with a fully trusted registry.
 No demo metadata or artifacts are deleted during cleanup.
+
+## Phase 6 routing and canary releases
+
+`ServiceContainer` now composes `RoutingManager`, `TrafficRouter`, and an injected
+`RoutingStrategy` alongside the existing inference services. `WeightedRandomStrategy`
+accepts an optional `random.Random` instance, validates candidate weights, and
+selects according to their relative probabilities with a short RNG lock. It never
+accesses repositories, runtimes, or global random state. Weighted allocations are
+probabilistic: a small request sample need not match percentages exactly.
+
+`SQLiteRoutingRepository` stores a detached `RoutingSnapshot` containing a
+`RoutingConfig`, integer revision, and optional `restored_from`. All persisted
+weights are validated through the Domain on read and write. Current weights and
+their revision commit atomically with an immutable history record and normalized
+version references. SQL triggers reject UPDATE/DELETE on historical entries and
+references. Foreign keys prevent deletion of any referenced version, including
+zero-weight and historical destinations. There is no automatic history cleanup.
+History protects metadata references; it is **not** an artifact backup, retention
+archive, or guarantee against filesystem loss. Keep artifacts and dependencies
+available for future rollback.
+
+The numbered migration `app/infrastructure/database/migrations.py` installs the
+three routing tables, immutability triggers, and a `schema_migrations` ledger entry
+(version 6) in one transaction. Legacy model/version/deployment tables remain
+unchanged. `initialize_database()` invokes this migration before serving traffic;
+it does not use `create_all()` to evolve the routing schema. Repeated initialization
+checks the ledger. Unexpected untracked routing tables fail rather than being
+silently adopted. Perform initialization during quiescent startup; concurrent
+startup writers may require an operator retry. This is a focused additive migration,
+not a general migration framework.
+
+### Eligibility, readiness, and admission
+
+`RoutingManager` verifies the model, every referenced version, and the complete
+Domain weight invariant (nonempty, integer 0..100, sum 100). Positive destinations
+must be REGISTERED and have at least one RUNNING deployment for that exact version.
+They must pass the existing `DeploymentManager.check_health()` load-readiness
+contract; no generic smoke prediction is invented. Deployment revisions are
+rechecked after readiness work. Zero-weight destinations must exist but need no
+running deployment and may be INVALID, FAILED, or STOPPED; they are never selected.
+Logical replicas retain the existing Phase 5 meaning and do not create workers.
+
+`TrafficRouter` reads one current configuration snapshot, verifies eligible
+metadata for **every** positive destination, rechecks deployment revisions, and
+calls the strategy once. If any active destination is unavailable, the whole
+automatic request fails with 503. It never drops a target and renormalizes remaining
+weights. Operators must explicitly change the allocation or roll back. The router
+does not load models or execute predictions. It cannot discover a latent artifact
+or runtime failure in an unselected version: configuration checks prove readiness
+at that time, and inference revalidates the selected runtime at admission. Existing
+health checks can record FAILED when a runtime subsequently fails readiness.
+
+`InferenceService` uses the selected version through its existing input validation,
+runtime retrieval, readiness, final deployment revision check, vectorized prediction,
+JSON normalization, and latency measurement. Explicit versions bypass the router
+entirely, even if the routing configuration is missing or unavailable. Omitted or
+null `version` uses routing; an empty or whitespace-only string remains invalid.
+The response always identifies the version actually executed. Batch routing occurs
+once per request, with one vectorized prediction preserving sample order.
+
+Routing validation, routing persistence, selection, and inference admission do not
+share a cross-repository transaction or distributed lease. A deployment stopped
+before the final observed revision check is rejected. A stop after validation can
+race a routing commit; later selection/admission rechecks reject the unavailable
+allocation without fallback. A routing update after selection applies to subsequent
+selections; the already selected request may use its earlier configuration snapshot.
+Requests admitted before undeploy may finish. No database transaction or routing lock
+spans prediction, and existing runtime caching and prediction locks are unchanged.
+
+### Local routing management API
+
+These controls have **no authentication or authorization** and must not be exposed
+publicly. They use synchronous handlers in the existing finite FastAPI thread pool.
+Existing body, tensor, and batch limits still apply.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/routing/{model_name}` | Read current weights, revision, timestamp, restore source |
+| PUT | `/routing/{model_name}` | Validate and create/update a complete allocation |
+| GET | `/routing/{model_name}/history` | Read immutable snapshots in ascending revision order |
+| POST | `/routing/{model_name}/rollback` | Validate historical targets and append restored weights |
+
+Create an initial canary with `PUT /routing/demo-linear`:
+
+```json
+{"weights":{"v1":90,"v2":10},"expected_revision":0}
+```
+
+Revision 0 is a create-only sentinel; initial stored revision is 1. The response
+has this shape (timestamp varies):
+
+```json
+{"model_name":"demo-linear","weights":{"v1":90,"v2":10},"revision":1,"updated_at":"2026-10-20T00:00:00Z","restored_from":null}
+```
+
+Update to `75/25`, `50/50`, or `0/100` by sending the entire replacement weights
+and the last observed `expected_revision`. Each successful mutation adds exactly
+one revision, even when weights are unchanged. Revision data is mandatory; stale
+writers and duplicate initial creation return 409. Invalid or duplicate JSON weight
+entries return 422; unknown models/versions/current configurations/history return
+404. Unavailable destinations or supporting services return sanitized 503 errors.
+No database or artifact paths are included in HTTP errors.
+
+Automatic prediction uses the existing endpoints:
+
+```json
+{"inputs":[[4.0],[5.0]]}
+```
+
+For `demo-linear/v1` the predictions are approximately `[9.0,11.0]`; for `v2` they
+are `[13.0,16.0]`. An explicit `"version":"v1"` continues to give only v1 results.
+
+To restore revision 1 when the current revision is 3, send
+`POST /routing/demo-linear/rollback`:
+
+```json
+{"target_revision":1,"expected_revision":3}
+```
+
+The manager checks current versions and readiness again, and the repository
+atomically appends revision 4 with restored weights and `restored_from: 1`.
+Revisions 2 and 3 remain unchanged. An unavailable historical destination blocks
+rollback; rollback is never an unchecked history-pointer change.
+
+### Optional persistent v2 and demonstrations
+
+Keep the same project working directory, `DATABASE_URL`, and `ARTIFACT_STORAGE_DIR`
+for the seed and server. The original Phase 5 seeder and live checks remain valid.
+To opt into a second trusted, locally trained version and initial 90/10 allocation:
+
+```powershell
+$env:TRUST_SKLEARN_ARTIFACTS = 'true'
+python -m examples.seed_development_model
+python -m examples.seed_routing_models
+python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+The focused routing seeder requires existing matching v1 metadata/bytes and a
+RUNNING v1 deployment. It never overwrites the v1 artifact or restarts v1. It
+verifies exact freshly generated bytes before deserializing either version, creates
+missing v2 as `y=3*x+1`, and deploys it as `demo-api-v2-deployment`. Inactive v2
+IDs remain unchanged; replacements use `-2`, `-3`, etc., and ready replacements
+are reused. Configuration collisions fail explicitly. An initial routing allocation
+is created only after readiness checks; existing operator routing stays unchanged.
+Run one seeder at a time with trusted private storage. Pickle trust restrictions
+and dependency-version mismatch behavior remain unchanged.
+
+The existing live checks still test explicit v1 predictions without mutating routing:
+
+```powershell
+python -m examples.test_live_api
+```
+
+After the optional v2 setup, add `--routing` to these live checks to read the
+current allocation and verify an automatic v1/v2 prediction without changing it:
+`python -m examples.test_live_api --routing`.
+
+Use Swagger `/docs` for optional-version predictions and routing controls. No
+external server is needed for the deterministic routing demonstration:
+
+```powershell
+python -m examples.routing_demo
+python -m pytest -q
+```
+
+The demo uses temporary SQLite/artifacts, two real sklearn models, a seeded RNG,
+HTTP requests, canary counts, an allocation change, immutable history, rollback,
+a stale-update conflict, and strict rejection after undeploy. Tests additionally
+cover separate repository writers, injected partial failures, and admission races.
+There is no sticky routing, automated canary analysis, rollout scheduler, metrics,
+authentication infrastructure, distributed locking, or Phase 7 implementation.

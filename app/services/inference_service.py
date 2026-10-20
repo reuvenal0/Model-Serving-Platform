@@ -1,4 +1,4 @@
-"""Explicit-version inference, guarded by deployment revision admission."""
+"""Explicit or routed inference, guarded by deployment revision admission."""
 
 from dataclasses import dataclass
 from time import perf_counter_ns
@@ -15,6 +15,7 @@ from app.interfaces.model_repository import ModelRepository
 from app.services.deployment_health_checker import DeploymentHealthChecker
 from app.services.inference_data import PredictionData
 from app.services.model_runtime_manager import ModelRuntimeManager
+from app.services.traffic_router import TrafficRouter
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,8 @@ class InferenceService:
     with RUNNING and the original revision intact. A subsequent stop may complete
     while an admitted prediction runs. No transaction spans prediction, and no
     cross-process inference lease is claimed. All candidates refer to the exact
-    requested version; this is not weighted/version traffic routing.
+    resolved version. Automatic requests select once before the same admission
+    path; explicit requests never call the router. No fallback is attempted.
     """
 
     def __init__(
@@ -40,6 +42,7 @@ class InferenceService:
         runtimes: ModelRuntimeManager, health_checker: DeploymentHealthChecker, *,
         max_batch_size: int = 128, max_tensor_dimensions: int = 4,
         max_tensor_elements: int = 100000,
+        traffic_router: TrafficRouter | None = None,
     ) -> None:
         if any(type(value) is not int or value <= 0 for value in (
             max_batch_size, max_tensor_dimensions, max_tensor_elements,
@@ -49,14 +52,19 @@ class InferenceService:
         self._deployments = deployments
         self._runtimes = runtimes
         self._health_checker = health_checker
+        self._traffic_router = traffic_router
         self._data = PredictionData(max_batch_size, max_tensor_dimensions, max_tensor_elements)
 
-    def predict(self, model_name: str, version: str, inputs: Any) -> InferenceResult:
+    def predict(self, model_name: str, version: str | None, inputs: Any) -> InferenceResult:
         started = perf_counter_ns()
         nonempty(model_name, "model_name")
-        nonempty(version, "version")
         if not isinstance(inputs, (list, dict)) or not inputs:
             raise PredictionInputError("Inputs must be a nonempty tensor or tensor mapping")
+        if version is None:
+            if self._traffic_router is None:
+                raise InferenceUnavailableError("Automatic routing is not configured")
+            version = self._traffic_router.select(model_name).version
+        nonempty(version, "version")
         self._models.get_model(model_name)
         metadata = self._models.get_version(model_name, version)
         if metadata.status is not ModelVersionStatus.REGISTERED:
@@ -98,7 +106,7 @@ class InferenceService:
         self._data.validate_schema(predictions, metadata.output_schema, output=True)
         return InferenceResult(model_name, version, predictions, (perf_counter_ns() - started) / 1_000_000)
 
-    def batch_predict(self, model_name: str, version: str, inputs: Any) -> InferenceResult:
+    def batch_predict(self, model_name: str, version: str | None, inputs: Any) -> InferenceResult:
         """Execute one batched tensor call, not a list of independent requests.
 
         Both endpoints accept the same bounded batched inputs. This explicit alias

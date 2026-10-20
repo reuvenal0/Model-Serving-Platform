@@ -141,3 +141,19 @@ class InferenceUnavailableError(DomainError):
 
 class ModelContractError(DomainError):
     """Opt-in inference schema metadata is invalid or unsupported."""
+
+
+class RoutingNotFoundError(DomainError):
+    """No current routing configuration exists for this model."""
+
+
+class RoutingHistoryNotFoundError(DomainError):
+    """The requested historical routing revision does not exist."""
+
+
+class RoutingConflictError(DomainError):
+    """Routing was already created or its expected revision is stale."""
+
+
+class RoutingUnavailableError(InferenceUnavailableError):
+    """An active routing destination is unavailable; no fallback is permitted."""
