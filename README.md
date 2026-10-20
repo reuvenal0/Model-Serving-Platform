@@ -790,3 +790,75 @@ constructed. Importing configuration initializes no services. The upload-size
 setting is reserved for a future upload boundary and is not enforced. Pass
 `settings.runtime_cache_max_size` to the runtime manager's `max_cache_size`
 constructor parameter; the manager does not read environment variables itself.
+
+## Persistent development API model
+
+Run these PowerShell commands from the project root, after installing `.[dev]`.
+Both processes must use the same working directory and environment settings:
+
+```powershell
+$env:TRUST_SKLEARN_ARTIFACTS = 'true'
+python -m examples.seed_development_model
+python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+In another terminal, from the project root:
+
+```powershell
+python -m examples.test_live_api
+```
+
+The seed prints the resolved SQLite filename, artifact root, logical artifact key,
+and deployment ID. Defaults are `./model_serving.db` and `./artifacts`, resolved
+against the working directory. Existing `DATABASE_URL` and `ARTIFACT_STORAGE_DIR`
+environment settings are honored unchanged by both seed and server. No `.env`
+file is loaded automatically. Persistent data remains after either process exits.
+
+Open [Swagger UI](http://127.0.0.1:8000/docs), select `POST /predict/{model_name}`,
+enter `demo-linear`, and submit:
+
+```json
+{"version": "v1", "inputs": [[4.0]]}
+```
+
+The response resembles the following (latency and floating-point rounding vary):
+
+```json
+{"model_name": "demo-linear", "version": "v1", "predictions": [9.0], "latency_ms": 0.5}
+```
+
+For `POST /predict/demo-linear/batch`, submit
+`{"version":"v1","inputs":[[4.0],[5.0]]}` and expect predictions approximately
+`[9.0,11.0]`. Both endpoints use vectorized tensors; batch preserves row order.
+The live script checks liveness, deployment readiness, prediction, and batch
+prediction, printing HTTP statuses, JSON, and PASS/FAIL with a nonzero failure exit.
+
+The seeder registers only missing records and checks existing metadata and exact
+artifact bytes against a newly trained deterministic estimator **before loading**.
+A mismatch is an error, never an overwrite. Dependency upgrades may change Pickle
+bytes; inspect mismatches manually rather than bypassing this safeguard. Run one
+seeder at a time without concurrent modification of demo records or storage.
+It reuses a valid RUNNING demo deployment. Inactive deployments remain unchanged;
+new ones use `demo-api-deployment-2`, `-3`, and so on. Subsequent seeds reuse an
+already RUNNING replacement. For a replacement, use the printed command:
+`python -m examples.test_live_api --deployment-id demo-api-deployment-2`.
+ID collisions with different configuration require manual inspection.
+
+Pickle can execute arbitrary code. `TRUST_SKLEARN_ARTIFACTS=true` is an explicit
+process-local development opt-in, not a sandbox or provenance check. Use private,
+trusted registry/storage data only; production defaults remain false. The seed
+never loads unrelated artifacts. The server trust flag applies to all sklearn
+artifacts it is asked to load, so do not expose this development server or storage
+to untrusted writers. Matching training and serving dependencies are required.
+
+After restart, persisted RUNNING status alone does not prove readiness. FastAPI
+startup creates its container but does not automatically run the global
+`DeploymentManager.reconcile()` sweep. The live script's deployment health request
+invokes the existing targeted readiness check in the **server process**, lazily
+loading the demo runtime; subsequent predictions also check readiness and revisions.
+Use this check after each restart before treating the demo as ready. The seed
+performs its own targeted smoke check but its in-memory runtime does not survive
+exit. No global reconciliation is invoked by the seed, since that would inspect
+and potentially load unrelated deployments. The existing explicit global reconcile
+procedure is reserved for a quiescent startup with a fully trusted registry.
+No demo metadata or artifacts are deleted during cleanup.
