@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.exceptions import (
     DuplicateModelError, DuplicateVersionError, ModelNotFoundError,
-    ModelVersionNotFoundError, RepositoryError,
+    ModelVersionNotFoundError, ModelVersionInUseError, RepositoryError,
 )
 from app.domain.enums import ModelFramework, ModelVersionStatus
 from app.domain.model import Model
@@ -123,14 +123,22 @@ class SQLiteModelRepository(ModelRepository):
             )]
 
     def delete_version(self, model_name: str, version: str) -> ModelVersion:
-        with self._transaction() as session:
-            record = session.scalar(select(ModelVersionRecord).where(
-                ModelVersionRecord.model_name == model_name,
-                ModelVersionRecord.version == version,
-            ))
-            if record is None:
-                raise ModelVersionNotFoundError(f"Version {model_name!r}/{version!r} does not exist")
-            deleted = self._version(record)
-            session.delete(record)
-            # The context commits before the caller receives the deleted snapshot.
-            return deleted
+        try:
+            with self._transaction() as session:
+                record = session.scalar(select(ModelVersionRecord).where(
+                    ModelVersionRecord.model_name == model_name,
+                    ModelVersionRecord.version == version,
+                ))
+                if record is None:
+                    raise ModelVersionNotFoundError(f"Version {model_name!r}/{version!r} does not exist")
+                deleted = self._version(record)
+                session.delete(record)
+                # The context commits before the caller receives the deleted snapshot.
+                return deleted
+        except IntegrityError as error:
+            # SQLite RESTRICT can use CONSTRAINT_TRIGGER rather than FOREIGNKEY.
+            if "FOREIGN KEY constraint failed" in str(error.orig):
+                raise ModelVersionInUseError(
+                    f"Version {model_name!r}/{version!r} is referenced by deployment history"
+                ) from error
+            raise RepositoryError("Could not delete version") from error

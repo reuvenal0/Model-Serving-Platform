@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import ForeignKey, JSON, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, Float, ForeignKey, ForeignKeyConstraint, JSON, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -62,3 +62,28 @@ class ModelVersionRecord(Base):
     output_schema: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+
+class DeploymentRecord(Base):
+    __tablename__ = "deployments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["model_name", "version"], ["model_versions.model_name", "model_versions.version"],
+            ondelete="RESTRICT", name="fk_deployments_model_version",
+        ),
+        CheckConstraint("replicas >= 0", name="ck_deployments_replicas"),
+        CheckConstraint("cpu > 0 AND memory_mb > 0", name="ck_deployments_resources"),
+        CheckConstraint("revision >= 0", name="ck_deployments_revision"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    model_name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    replicas: Mapped[int] = mapped_column(nullable=False)
+    cpu: Mapped[float] = mapped_column(Float, nullable=False)
+    memory_mb: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    endpoint: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    revision: Mapped[int] = mapped_column(nullable=False)

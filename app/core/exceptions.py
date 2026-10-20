@@ -86,3 +86,42 @@ class UntrustedArtifactError(ModelLoadingError):
 
 class PredictionError(DomainError):
     """Prediction inputs are unsupported or backend execution failed."""
+
+
+class DeploymentNotFoundError(DomainError):
+    """The requested deployment does not exist."""
+
+
+class DuplicateDeploymentError(DomainError):
+    """A deployment ID is already in use."""
+
+
+class DeploymentPersistenceError(RepositoryError):
+    """Deployment metadata could not be read or committed."""
+
+
+class DeploymentConflictError(DomainError):
+    """The snapshot is stale or SQLite requires retrying after a fresh read."""
+
+
+class DeploymentHealthCheckError(DomainError):
+    """Load-readiness or an explicitly configured prediction check failed."""
+
+
+class DeploymentRecoveryError(DomainError):
+    """Lifecycle work failed and recording FAILED also failed."""
+
+    def __init__(
+        self, deployment_id: str, operation_error: Exception, persistence_error: Exception,
+    ) -> None:
+        self.deployment_id = deployment_id
+        self.operation_error = operation_error
+        self.persistence_error = persistence_error
+        super().__init__(
+            f"Deployment {deployment_id!r} failed and FAILED could not be recorded; "
+            "inspect persisted state and reconcile before treating it as ready"
+        )
+
+
+class ModelVersionInUseError(DomainError):
+    """Deployment history references this version; deletion is prohibited."""

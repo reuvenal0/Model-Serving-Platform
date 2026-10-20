@@ -3,14 +3,16 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 3 - Model Execution & Runtime Management
+## Current scope: Phase 4 - Deployment Lifecycle & Health Management
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
 Python service. Phase 2.5 adds controlled logical deployment transitions and safe
 routing configuration updates. Phase 3 adds real trusted sklearn/ONNX loading,
-in-process prediction, and lazy, thread-safe runtime caching. Existing domain
-invariants, registry behavior, persistence, and storage remain unchanged.
+in-process prediction, and lazy, thread-safe runtime caching. Phase 4 adds persistent
+logical deployments, guarded lifecycle orchestration, conservative readiness,
+startup reconciliation, and deployment-aware deletion safety. Domain invariants
+and the artifact subsystem are unchanged. No Phase 5 routing or APIs exist.
 
 ```text
 ModelRegistry
@@ -46,7 +48,7 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-The suite retains all 328 tests from Phases 1, 2, and 2.5. Execution tests build
+The suite retains all 421 tests from Phases 1 through 3. Execution tests build
 small deterministic models locally, with no artifact downloads. Integration tests
 use temporary SQLite databases and storage roots; event/barrier-controlled tests
 verify cache concurrency and invalidation races without timing sleeps.
@@ -56,14 +58,17 @@ Run the repeatable demonstration after installing the project:
 ```bash
 python examples/registry_demo.py
 python examples/inference_demo.py
+python examples/deployment_demo.py
 ```
 
 The registry demo registers and retrieves harmless binary data without executing
 it. The inference demo trains a trusted local sklearn model for `y = 2*x + 1`,
 registers its Pickle bytes, predicts twice, verifies runtime identity reuse, and
 prints cache statistics. It also builds and executes an equivalent ONNX graph
-using the `onnx` development dependency. Both demos dispose their database engines
-and remove temporary data on exit. Neither starts an API server.
+using the `onnx` development dependency. The deployment demo observes persisted
+DEPLOYING, completes a model-specific readiness check, shows RUNNING, scales logical
+replicas from 1 to 3, reads persisted metadata, stops, and rejects an illegal scale.
+All demos dispose their engines and remove temporary data. None starts a server.
 
 ## Metadata persistence
 
@@ -280,6 +285,168 @@ INVALID version status, or an invalid loader result; its subclass
 and unsupported inputs raise `PredictionError`. Backend causes are chained rather
 than discarded. Failures never silently return `None` or poison the runtime cache.
 
+## Phase 4 deployment architecture
+
+```text
+DeploymentManager
+  +-- DeploymentRepository -> SQLiteDeploymentRepository
+  +-- ModelRepository     -> existing version identity/eligibility checks
+  +-- ModelRuntimeManager -> existing shared lazy loading and LRU
+  +-- DeploymentHealthChecker -> LoadedModel.predict (optional smoke check)
+```
+
+New implementation files are `app/interfaces/deployment_repository.py`,
+`app/infrastructure/database/sqlite_deployment_repository.py`,
+`app/services/deployment_manager.py`, and
+`app/services/deployment_health_checker.py`. `DeploymentRecord` joins the existing
+SQLAlchemy metadata. No model loader, runtime cache, or Domain lifecycle code was
+duplicated. No new packages or configuration settings are required.
+
+Compose a `SQLiteDeploymentRepository(sessionmaker(engine))` with the existing
+SQLite engine helper and inject it, the existing model repository/runtime manager,
+and a `DeploymentHealthChecker` into `DeploymentManager`. Both metadata repositories
+must use the same database for the version-reference constraints to protect them.
+
+### Persistent metadata and concurrency
+
+The `deployments` table stores ID, model/version identity, replica count,
+CPU/memory, status, optional endpoint metadata, aware UTC timestamps, and an integer
+revision. Deployment IDs are unique and distinct from model/version identity;
+multiple records may reference the same version. A composite foreign key points
+to the registered `(model_name, version)` pair. The existing engine helper enables
+foreign keys on every SQLite connection. Resources and timestamps reconstruct
+existing Domain objects, including microseconds and UTC offsets.
+
+The deployment repository returns `DeploymentSnapshot(deployment, revision)`;
+revision tokens live outside the Domain. Initial saves are insert-only at revision
+0. `update_deployment(deployment, expected_revision=...)` uses one conditional SQL
+UPDATE to match the ID, revision, and immutable identity/creation fields and
+increment the revision. A stale caller cannot overwrite a newer state, even
+through a separate repository/engine/process using the same database. The manager
+returns ordinary Domain entities and keeps tokens within each lifecycle operation.
+
+Missing IDs raise `DeploymentNotFoundError`, duplicate saves raise
+`DuplicateDeploymentError`, and stale updates raise `DeploymentConflictError`.
+SQLite BUSY/LOCKED conflicts also raise `DeploymentConflictError`: re-read and
+reconsider the operation before retrying. There are no blind retries. Other
+backend errors raise `DeploymentPersistenceError` with their cause. Transactions
+are scoped to repository calls; none spans model loading, waiting, or prediction.
+No global management lock is used. The repository validates entity construction
+but does not implement a separate transition state machine.
+
+SQLite still has limited writer concurrency. These constraints/CAS updates protect
+metadata; they are not distributed worker coordination or an execution lease.
+Direct SQL writers that bypass revisions do not receive stale-write protection.
+The setup follows SQLAlchemy's [composite foreign-key guidance](https://docs.sqlalchemy.org/en/20/core/constraints.html)
+and [SQLite concurrency documentation](https://docs.sqlalchemy.org/en/20/dialects/sqlite.html).
+
+`initialize_database()` creates missing tables, including the new deployment table,
+without altering existing ones. It is not a migration system. Existing databases
+with incompatible layouts require an explicit migration before use; schema
+versions, data backfills, and ALTER TABLE migration automation are not implemented.
+
+### Lifecycle orchestration and failures
+
+`deploy(model_name, version, resources, *, replicas=1, deployment_id=None,
+smoke_inputs=...)` validates the request, verifies the model and a REGISTERED
+version, allocates a UUID deployment ID unless supplied, and commits DEPLOYING.
+It then obtains the runtime, checks readiness, invokes the Domain's `activate()`,
+and commits RUNNING using the original revision. No endpoint URL is invented.
+
+Loading/readiness failure invokes the Domain's `fail()` on a copy and attempts to
+commit FAILED. The original error is re-raised after successful failure recording.
+If committing RUNNING fails for a backend reason, FAILED is attempted against the
+original DEPLOYING revision. A stale activation conflict is propagated without
+retrying or overwriting another operation's state, including a scale that leaves
+the record DEPLOYING. Inspect the record and reconcile or create a new deployment.
+
+When failure-state persistence also fails, `DeploymentRecoveryError` contains
+`deployment_id`, `operation_error`, and `persistence_error`, with the persistence
+failure chained. The database can still contain DEPLOYING or an unverified RUNNING
+record. Do not interpret it as healthy or silently ignore this error: restore
+storage access and revalidate/reconcile. Uncertain commit outcomes likewise require
+inspection; this is not crash-safe coordination between database and runtime work.
+
+The exact Domain rules remain the table in **Controlled domain operations** below.
+In particular, activation is DEPLOYING -> RUNNING; failure is DEPLOYING/RUNNING ->
+FAILED; stop is DEPLOYING/RUNNING/FAILED -> STOPPED. Repeated stop is rejected with
+`InvalidDeploymentStateError`; no automatic restart of FAILED/STOPPED records exists.
+`scale(id, replicas)` invokes `Deployment.scale`, then persists with its read
+revision. Failed validation leaves the saved snapshot untouched. Replicas remain
+nonnegative integers, including zero, and are **logical metadata only**: changing
+1 to 3 launches no processes, containers, sessions, or extra execution capacity.
+Resource requests are also metadata, not enforced CPU/memory quotas.
+
+`undeploy(id)` invokes `stop()` and commits STOPPED, preserving history, resources,
+and replica count. It does not evict/close a runtime or terminate active calls.
+`get_deployment(id)` and `list_deployments(model_name=None)` return Domain snapshots;
+listing sorts by ID and a filter with no matches returns an empty list.
+
+### Readiness and shared cache behavior
+
+Persisted RUNNING status is lifecycle intent, not process readiness. Use
+`check_health(id)` before treating a deployment as ready. For DEPLOYING, FAILED,
+or STOPPED, it returns `ready=False` without loading/predicting. For RUNNING it
+obtains the current shared runtime (lazily reloading after eviction), checks it,
+and re-reads the revision before returning `DeploymentHealth`. If a concurrent
+operation changed the record, it raises a conflict instead of reporting stale
+readiness. This is a point-in-time observation, not an inference authorization
+lease; callers must coordinate any later use. There is no deployment inference API.
+
+The default `load` check proves that a runtime was obtained and exposes predict;
+it does **not** call predict or synthesize a universal feature matrix. Passing
+explicit `smoke_inputs` to deploy or check_health invokes one genuine prediction
+and reports check kind `smoke`. Inputs must be valid, trusted, model-specific
+fixtures (including the existing ONNX named-input contract). Successful completion
+does not prove accuracy or that every future input will work. Smoke inputs are
+not persisted; restart checks default to load-readiness. The checker itself never
+loads/deserializes artifacts and inherits the trusted-source restrictions of the
+injected loaders.
+
+Load/smoke failure during RUNNING health checks attempts to persist FAILED with
+optimistic concurrency; original errors and failed recovery remain explicit. A
+cached runtime alone never establishes deployment status. Deployments sharing a
+version share cache identity; stopping one leaves others operational. Eviction
+changes no deployment metadata, and no pinning or reference-counting is added.
+Logical replica count (including zero) is not runtime-residency or capacity proof.
+
+### Startup reconciliation
+
+Call `manager.reconcile()` explicitly during **quiescent single-process startup,
+before accepting work**. It revalidates persisted RUNNING records against the
+current runtime manager, marks interrupted DEPLOYING records FAILED, and leaves
+FAILED/STOPPED records inactive. It never automatically restarts them. A fresh
+process has an empty cache and must reload its RUNNING versions; no persisted
+readiness evidence is trusted.
+
+The returned `ReconciliationReport` has `health` observations and explicit
+`failures` containing deployment IDs and original/recovery errors. Processing
+continues after individual failures; callers must inspect failures before
+advertising readiness. A list/read failure that prevents reconciliation itself
+propagates. There is no background monitor, process lease, multi-process startup
+arbitration, or automatic recovery retry. Do not run this startup sweep against
+another process's live deployment attempts. Regular lifecycle updates still use
+revisions to prevent stale completions from restoring RUNNING.
+
+### Deployment-aware version deletion
+
+The deletion policy is deliberately conservative: **every deployment history
+reference blocks version deletion**, including DEPLOYING, RUNNING, FAILED, and
+STOPPED records. Active states must retain their artifacts; inactive history must
+remain reconstructable through its foreign key. Archiving history and relaxing
+this restriction require a future explicit retention policy.
+
+SQLite enforces `ON DELETE RESTRICT` on the composite foreign key. This is atomic
+with metadata writes and protects against a deployment appearing after a registry
+precheck: if deployment insertion wins, deletion is rejected; if deletion wins,
+a later deployment insert fails its parent-version foreign key. Lock contention
+may instead require retrying after a fresh read. Integration tests cover both
+orderings and independent connections. No check-then-delete service coupling is
+used. `SQLiteModelRepository.delete_version` narrowly translates a rejected delete
+into `ModelVersionInUseError`. The existing ModelRegistry already deletes metadata
+before bytes, so it propagates that error while preserving the artifact.
+Versions with no deployment history retain the original deletion behavior.
+
 ## Current limitations
 
 - SQLite and filesystem operations are separate transactions. Compensating actions
@@ -292,8 +459,8 @@ than discarded. Failures never silently return `None` or poison the runtime cach
 - Schema initialization creates missing tables; migrations are not implemented.
 - Artifacts use an in-memory bytes API. Streaming and configured upload-size
   enforcement are not implemented. POSIX storage requires hard-link support.
-- Deployment-aware deletion protection belongs to Phase 4; no deployment checks
-  exist yet.
+- Deployment history prevents version deletion even after stopping. No history
+  archival/purge policy is implemented.
 - Model loading and prediction run inside the application process, with no worker
   subprocess, process isolation, timeout, cancellation, or resource enforcement.
   A bad artifact/backend can exhaust resources or crash the process.
@@ -303,9 +470,10 @@ than discarded. Failures never silently return `None` or poison the runtime cach
 - Registry deletion/re-registration does not automatically notify runtime caches.
   Callers must invalidate affected entries or clear caches and coordinate any
   concurrent registry changes. Existing users of a detached runtime may finish.
-- Deployment orchestration, REST APIs, traffic routing, metrics, authentication,
-  background workers, cloud adapters, and distributed coordination are not
-  implemented. The `api` package remains empty.
+- Deployment currently means logical readiness in this application instance.
+  Remote/container orchestration, real replica workers, REST APIs, traffic routing,
+  metrics, authentication, background workers, cloud adapters, and distributed
+  coordination are not implemented. The `api` package remains empty.
 
 ## Domain conventions
 
@@ -336,8 +504,8 @@ than discarded. Failures never silently return `None` or poison the runtime cach
 
 `Deployment.activate()`, `fail()`, and `stop()` record logical state changes.
 They perform no external deployment, health checks, cleanup, or orchestration.
-A future DeploymentManager performs infrastructure work and then records its
-result through these methods. Allowed transitions are deliberately limited:
+DeploymentManager obtains the shared runtime, checks readiness, and records the
+logical result through these methods; it performs no remote orchestration. Allowed transitions are deliberately limited:
 
 | Current status | `activate()` | `fail()` | `stop()` | `scale(replicas)` |
 | --- | --- | --- | --- | --- |
@@ -382,8 +550,8 @@ serialization, so no ORM or registry changes are needed.
 
 `ModelVersion` still describes registration status (REGISTERED or INVALID), not a
 deployment lifecycle. No status methods were added because validation execution
-and a lifecycle policy have not been specified. `Model`, `ResourceConfig`, enums,
-and the exception hierarchy are unchanged.
+and a lifecycle policy have not been specified. `Model`, `ResourceConfig`, and enums remain unchanged. Application exceptions
+cover deployment persistence and recovery.
 
 ## Configuration
 

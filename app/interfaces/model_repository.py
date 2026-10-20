@@ -43,4 +43,8 @@ class ModelRepository(ABC):
 
     @abstractmethod
     def delete_version(self, model_name: str, version: str) -> ModelVersion:
-        """Atomically delete and return its snapshot, preserving the parent model."""
+        """Delete and return a snapshot, preserving the parent model.
+
+        ModelVersionInUseError protects versions referenced by deployment history.
+        The backend must enforce this atomically with deletion, not via prechecks.
+        """
