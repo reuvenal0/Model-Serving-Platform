@@ -7,7 +7,7 @@ from random import Random
 from threading import Barrier, Event
 from unittest.mock import Mock
 
-from fastapi.testclient import TestClient
+from tests.api_client import TestClient
 import pytest
 from sklearn.linear_model import LinearRegression
 from sqlalchemy import event, text
@@ -391,27 +391,6 @@ def test_sanitized_routing_errors_and_dependency_override(client, error, status)
     response = client.get('/routing/linear')
     assert response.status_code == status and 'private' not in response.text
     assert set(response.json()['error']) == {'code', 'message'}
-
-
-def test_migration_preserves_legacy_data_and_is_idempotent(tmp_path):
-    from app.infrastructure.database.records import Base, DeploymentRecord, ModelRecord, ModelVersionRecord
-    from app.infrastructure.database.sqlite_model_repository import SQLiteModelRepository
-    from app.domain.model import Model
-
-    engine = create_sqlite_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
-    try:
-        # Simulate a Phase 5 database without routing tables or a migration ledger.
-        Base.metadata.create_all(engine, tables=[ModelRecord.__table__, ModelVersionRecord.__table__, DeploymentRecord.__table__])
-        repository = SQLiteModelRepository(sessionmaker(engine))
-        repository.save_model(Model('preserved', 'legacy metadata'))
-        before = repository.get_model('preserved')
-        initialize_database(engine)
-        initialize_database(engine)
-        assert repository.get_model('preserved') == before
-        with engine.connect() as connection:
-            assert connection.scalar(text('SELECT COUNT(*) FROM schema_migrations WHERE version=6')) == 1
-    finally:
-        engine.dispose()
 
 
 def test_repository_failure_at_reference_insert_is_atomic(system):

@@ -1,8 +1,41 @@
 """Enforce the real HTTP body byte limit before JSON/Pydantic parsing."""
 
 from starlette.types import ASGIApp, Receive, Scope, Send
+import logging
 
 from app.api.errors import error_response
+
+
+class SanitizedErrorMiddleware:
+    """Contain unexpected HTTP exceptions before Starlette re-raises to servers.
+
+    Domain/HTTP errors are handled by the existing inner exception handlers.
+    Never attach a backend exception or its context to an internal diagnostic.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracked_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked_send)
+        except Exception:
+            logging.getLogger(__name__).error("Unhandled API error: request could not be completed")
+            if started:
+                # Headers cannot be replaced; abort without the private cause.
+                raise RuntimeError("HTTP response could not be completed") from None
+            await error_response(500, "internal_error", "Request could not be completed")(scope, receive, send)
 
 
 class RequestBodyLimitMiddleware:

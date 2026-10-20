@@ -1,13 +1,12 @@
 """Sanitized, stable HTTP error responses without backend exception details."""
 
-import logging
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from app.core import exceptions as errors
+from app.services.inference_admission import AdmissionRejectedError
 
 
 def error_response(status: int, code: str, message: str) -> JSONResponse:
@@ -15,6 +14,7 @@ def error_response(status: int, code: str, message: str) -> JSONResponse:
 
 
 _MAPPINGS = (
+    ((AdmissionRejectedError,), 503, "inference_capacity_unavailable", "Inference admission capacity is unavailable"),
     ((errors.RoutingNotFoundError, errors.RoutingHistoryNotFoundError),
      404, "routing_not_found", "Requested routing configuration or revision was not found"),
     ((errors.RoutingConflictError,), 409, "routing_conflict", "Routing revision changed; read it before retrying"),
@@ -51,5 +51,6 @@ def install_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, error: Exception):
-        logging.getLogger(__name__).error("Unhandled API error", exc_info=error)
+        # The ASGI boundary already emits the sanitized diagnostic. This remains
+        # a response-only fallback and must not log the exception again.
         return error_response(500, "internal_error", "Request could not be completed")

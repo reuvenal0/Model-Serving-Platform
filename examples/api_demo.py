@@ -1,6 +1,7 @@
 """Real HTTP inference using temporary resources and in-process TestClient."""
 
 from pathlib import Path
+from secrets import token_urlsafe
 import pickle
 from tempfile import TemporaryDirectory
 
@@ -21,12 +22,12 @@ def main() -> None:
     artifact = pickle.dumps(estimator, protocol=pickle.HIGHEST_PROTOCOL)
     with TemporaryDirectory(prefix="api-demo-") as directory:
         root = Path(directory)
-        settings = Settings(
+        settings = Settings(admin_api_key=token_urlsafe(32),
             database_url=URL.create("sqlite", database=str(root / "metadata.db")).render_as_string(),
             artifact_storage_dir=root / "artifacts", trust_sklearn_artifacts=True,
         )
         app = create_app(settings)
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000), headers={"X-API-Key": settings.admin_api_key}) as client:
             container: ServiceContainer = app.state.container
             print("API startup liveness:", client.get("/health").json())
             container.model_registry.register_model("linear-demo")

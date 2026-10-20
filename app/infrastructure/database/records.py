@@ -145,3 +145,16 @@ class InferenceLogRecord(Base):
     error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
     timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     input_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+# SQLite routing history is append-only even for direct SQL consumers. These
+# guards belong to the final metadata bootstrap, not a historical migration.
+from sqlalchemy import DDL, event
+
+for _record in (RoutingHistoryRecord, RoutingVersionReferenceRecord):
+    for _operation in ('UPDATE', 'DELETE'):
+        event.listen(_record.__table__, 'after_create', DDL(
+            f'CREATE TRIGGER {_record.__tablename__}_no_{_operation.lower()} '
+            f'BEFORE {_operation} ON {_record.__tablename__} '
+            "BEGIN SELECT RAISE(ABORT, 'Routing history is immutable'); END"
+        ).execute_if(dialect='sqlite'))

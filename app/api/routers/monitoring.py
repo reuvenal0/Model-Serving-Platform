@@ -3,19 +3,28 @@
 from typing import Annotated
 from dataclasses import replace
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from app.api.security import require_operator
 from pydantic import AwareDatetime
 
 from app.api.dependencies import get_metrics_collector, get_runtime_resource_monitor
 from app.api.routers.inference import ModelName
 from app.api.schemas.inference import ErrorResponse
 from app.api.schemas.monitoring import InferenceLogResponse, LogPageResponse, MetricsResponse, RuntimeResourcesResponse
+from app.api.schemas.monitoring import AdmissionResourcesResponse
 from app.interfaces.inference_log_repository import MAX_LOG_CURSOR, LogFilters
 from app.services.metrics_collector import MetricsCollector
 from app.services.runtime_resource_monitor import RuntimeResourceMonitor
 
-router = APIRouter(responses={status: {"model": ErrorResponse} for status in (422, 500, 503)})
+router = APIRouter(dependencies=[Depends(require_operator)],
+                   responses={status: {"model": ErrorResponse} for status in (401, 403, 422, 500, 503)})
 Collector = Annotated[MetricsCollector, Depends(get_metrics_collector)]
+
+
+@router.get("/runtime/admission", response_model=AdmissionResourcesResponse)
+async def admission_resources(request: Request) -> dict[str, int | float]:
+    """Capacity diagnostics only; rejected HTTP work is not an inference observation."""
+    return request.app.state.inference_admission.snapshot()
 
 
 def observation_filters(

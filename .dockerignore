@@ -1,0 +1,37 @@
+# Allow only reviewed source/configuration into the build context.
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!requirements/
+!requirements/*.lock
+!app/
+!app/**
+!examples/
+!examples/*.py
+!scripts/
+!scripts/*.py
+# Always exclude generated files and any secrets/data even beneath allowed trees.
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.artifact
+**/*.pkl
+**/*.pickle
+**/*.joblib
+**/*.onnx
+**/*.npy
+**/*.npz
+**/secrets/
+**/.aws/
+**/.ssh/
+**/artifacts/
+**/.git/
+**/.venv/
+**/.tmp/

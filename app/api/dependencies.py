@@ -13,14 +13,14 @@ from app.services.metrics_collector import MetricsCollector
 from app.services.runtime_resource_monitor import RuntimeResourceMonitor
 
 
-def get_container(request: Request) -> ServiceContainer:
+async def get_container(request: Request) -> ServiceContainer:
     container = getattr(request.app.state, "container", None)
     if container is None:
         raise InferenceUnavailableError("Application lifespan has not initialized services")
     return container
 
 
-def get_inference_service(
+async def get_inference_service(
     container: Annotated[ServiceContainer, Depends(get_container)],
 ) -> InferenceService:
     return container.inference_service

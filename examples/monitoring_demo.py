@@ -2,6 +2,7 @@
 
 from dataclasses import asdict
 from pathlib import Path
+from secrets import token_urlsafe
 import pickle
 from random import Random
 from tempfile import TemporaryDirectory
@@ -23,7 +24,7 @@ from app.services.weighted_random_strategy import WeightedRandomStrategy
 def main() -> None:
     with TemporaryDirectory(prefix='monitoring-demo-') as directory:
         root = Path(directory)
-        settings = Settings(database_url=f"sqlite:///{root / 'metadata.db'}",
+        settings = Settings(admin_api_key=token_urlsafe(32), database_url=f"sqlite:///{root / 'metadata.db'}",
                             artifact_storage_dir=root / 'artifacts', trust_sklearn_artifacts=True)
         with ServiceContainer(settings, routing_strategy=WeightedRandomStrategy(Random(42))) as container:
             registry = container.model_registry
@@ -34,7 +35,7 @@ def main() -> None:
                                           pickle.dumps(estimator,protocol=pickle.HIGHEST_PROTOCOL))
                 container.deployment_manager.deploy('observed-linear',version,ResourceConfig(1,128),deployment_id=version)
             container.routing_manager.configure_routing('observed-linear',{'v1':90,'v2':10},0)
-            with TestClient(create_app(container=container)) as client:
+            with TestClient(create_app(container=container), client=("127.0.0.1", 50000), headers={"X-API-Key": settings.admin_api_key}) as client:
                 for version in ('v1','v2'):
                     response = client.post('/predict/observed-linear',json={'version':version,'inputs':[[4.0]]})
                     response.raise_for_status()

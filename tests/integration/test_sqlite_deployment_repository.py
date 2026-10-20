@@ -189,11 +189,13 @@ def test_backend_errors_and_corrupt_records_are_translated(deployments, engine):
         deployments.get_deployment("d-1")
 
 
-def test_initialization_adds_missing_deployment_table_without_rewriting_model_data(deployments, repository, engine):
+def test_initialization_rejects_missing_deployment_table_without_rewriting_model_data(deployments, repository, engine):
     # Simulate a Phase 3 database: model tables/data exist, deployments does not.
     DeploymentRecord.__table__.drop(engine)
     before = repository.get_version("model", "v1")
-    initialize_database(engine)
+    from app.infrastructure.database.database import SchemaCompatibilityError
+    with pytest.raises(SchemaCompatibilityError):
+        initialize_database(engine)
     assert repository.get_version("model", "v1") == before
-    assert deployments.list_deployments() == []
-    assert deployments.save_deployment(entity()).revision == 0
+    from sqlalchemy import inspect
+    assert 'deployments' not in inspect(engine).get_table_names()

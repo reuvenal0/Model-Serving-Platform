@@ -5,7 +5,7 @@ from dataclasses import replace
 from threading import Event
 from unittest.mock import Mock
 
-from fastapi.testclient import TestClient
+from tests.api_client import TestClient
 import pytest
 
 from app.config import Settings

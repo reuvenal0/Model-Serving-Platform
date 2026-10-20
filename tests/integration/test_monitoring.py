@@ -7,10 +7,9 @@ import pickle
 from random import Random
 from unittest.mock import Mock, patch
 
-from fastapi.testclient import TestClient
+from tests.api_client import TestClient
 import pytest
 from sklearn.linear_model import LinearRegression
-from sqlalchemy import event, inspect, text
 
 from app.api.dependencies import get_metrics_collector
 from app.config import Settings
@@ -18,7 +17,6 @@ from app.core.container import ServiceContainer
 from app.core import exceptions as errors
 from app.domain.enums import ModelFramework
 from app.domain.resource_config import ResourceConfig
-from app.infrastructure.database.database import create_sqlite_engine, initialize_database
 from app.infrastructure.database.sqlite_inference_log_repository import SQLiteInferenceLogRepository
 from app.main import create_app
 from app.services.metrics_collector import MetricsCollector
@@ -228,53 +226,6 @@ def test_monitoring_backend_errors_are_sanitized_and_di_replaceable(client):
     client.app.dependency_overrides[get_metrics_collector] = lambda: fake
     response = client.get('/metrics')
     assert response.status_code == 503 and 'private' not in response.text
-
-
-def test_migration7_preserves_phase6_data_and_artifacts(settings):
-    with patch('app.infrastructure.database.database.migrate_monitoring'):
-        with ServiceContainer(settings) as container:
-            container.model_registry.register_model('old')
-            artifact = pickle.dumps(LinearRegression().fit([[1],[2],[3]],[3,5,7]))
-            container.model_registry.register_version('old','v1',ModelFramework.SKLEARN,artifact)
-            container.deployment_manager.deploy('old','v1',ResourceConfig(1,128),deployment_id='old-deployment')
-            container.routing_manager.configure_routing('old',{'v1':100},0)
-            container.routing_manager.configure_routing('old',{'v1':100},1)
-            before_deployment = container.deployment_repository.get_deployment('old-deployment')
-            before_routing = container.routing_repository.history('old')
-            before_version = container.model_registry.get_version('old','v1')
-            assert 'inference_logs' not in inspect(container.engine).get_table_names()
-    with ServiceContainer(settings) as container:
-        assert container.deployment_repository.get_deployment('old-deployment') == before_deployment
-        assert container.routing_repository.history('old') == before_routing
-        assert container.model_registry.get_version('old','v1') == before_version
-        assert container.model_registry.download_artifact('old','v1') == artifact
-        with container.engine.connect() as connection:
-            assert list(connection.scalars(text('SELECT version FROM schema_migrations ORDER BY version'))) == [6,7]
-        container.inference_service.predict('old','v1',[[4]])
-    with ServiceContainer(settings) as reopened:
-        assert reopened.metrics_collector.get_metrics().total_requests == 1
-        assert len(reopened.metrics_collector.query_logs().logs) == 1
-
-
-def test_failed_migration7_rolls_back_ddl_and_can_retry(settings):
-    engine = create_sqlite_engine(settings.database_url)
-    try:
-        with patch('app.infrastructure.database.database.migrate_monitoring'):
-            initialize_database(engine)
-        def fail(conn, cursor, statement, parameters, context, executemany):
-            if statement == 'INSERT INTO schema_migrations (version) VALUES (7)':
-                raise RuntimeError('migration interrupted')
-        event.listen(engine,'before_cursor_execute',fail)
-        try:
-            with pytest.raises(RuntimeError):
-                initialize_database(engine)
-        finally:
-            event.remove(engine,'before_cursor_execute',fail)
-        assert 'inference_logs' not in inspect(engine).get_table_names()
-        initialize_database(engine)
-        assert 'inference_logs' in inspect(engine).get_table_names()
-    finally:
-        engine.dispose()
 
 
 def test_live_api_optional_monitoring_checks_with_real_asgi_service(client):

@@ -55,3 +55,16 @@ class RuntimeResourcesResponse(BaseModel):
     rss_bytes: int | None = Field(ge=0)
     rss_available: bool
     cache: RuntimeCacheResponse
+
+
+class AdmissionResourcesResponse(BaseModel):
+    active: int = Field(ge=0)
+    waiting: int = Field(ge=0)
+    capacity: int = Field(gt=0)
+    waiting_capacity: int = Field(ge=0)
+    capacity_rejections: int = Field(ge=0)
+    wait_timeouts: int = Field(ge=0)
+    admitted_requests: int = Field(ge=0)
+    total_admission_wait_seconds: float = Field(ge=0, allow_inf_nan=False)
+    max_admission_wait_seconds: float = Field(ge=0, allow_inf_nan=False)
+    wait_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)

@@ -1,0 +1,9 @@
+# Direct runtime versions from the verified Phase 8A environment.
+SQLAlchemy==2.1.5
+numpy==2.5.4
+scikit-learn==1.9.1
+onnxruntime==1.31.0
+fastapi==0.150.0
+starlette==0.52.1
+pydantic==2.14.1
+uvicorn==0.54.0

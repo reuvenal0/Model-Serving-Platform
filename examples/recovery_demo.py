@@ -1,6 +1,7 @@
 """Automatic restart recovery and resource safety with disposable local data."""
 
 from pathlib import Path
+from secrets import token_urlsafe
 import pickle
 from tempfile import TemporaryDirectory
 
@@ -17,13 +18,13 @@ from app.main import create_app
 def main() -> None:
     with TemporaryDirectory(prefix='recovery-demo-') as directory:
         root = Path(directory)
-        settings = Settings(database_url=f"sqlite:///{root / 'metadata.db'}",
+        settings = Settings(admin_api_key=token_urlsafe(32), database_url=f"sqlite:///{root / 'metadata.db'}",
                             artifact_storage_dir=root / 'artifacts',trust_sklearn_artifacts=True,
                             max_runtime_artifact_bytes=1024,runtime_cache_max_size=1)
         artifact = pickle.dumps(LinearRegression().fit([[1.0],[2.0],[3.0]],[3.0,5.0,7.0]),
                                 protocol=pickle.HIGHEST_PROTOCOL)
         first = create_app(settings)
-        with TestClient(first):
+        with TestClient(first, client=("127.0.0.1", 50000), headers={"X-API-Key": settings.admin_api_key}):
             container = first.state.container
             container.model_registry.register_model('recovered-linear')
             container.model_registry.register_version('recovered-linear','v1',ModelFramework.SKLEARN,artifact)
@@ -33,7 +34,7 @@ def main() -> None:
             raise RuntimeError('First application did not close owned resources')
         print('First application shut down; metadata and artifact persist in the temporary environment.')
         second = create_app(settings)
-        with TestClient(second) as client:
+        with TestClient(second, client=("127.0.0.1", 50000), headers={"X-API-Key": settings.admin_api_key}) as client:
             report = second.state.startup_report
             if report.failures or not all(item.ready for item in report.health):
                 raise RuntimeError('Automatic startup recovery did not complete')

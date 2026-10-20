@@ -1,0 +1,66 @@
+name: verify
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.13'
+          cache: pip
+          cache-dependency-path: requirements/*.lock
+      - name: Install locked build and development dependencies
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/build.lock
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/dev.lock
+          python -m pip install --no-build-isolation --no-deps -e '.[dev]'
+          python -m pip check
+      - name: Syntax, imports and architecture
+        run: python scripts/check_project.py
+      - name: Scoped correctness lint
+        run: python -m ruff check app examples scripts tests
+      - name: Complete tests
+        run: python -m pytest -q
+      - name: Existing isolated demonstrations
+        run: |
+          python -m examples.registry_demo
+          python -m examples.inference_demo
+          python -m examples.deployment_demo
+          python -m examples.api_demo
+          python -m examples.routing_demo
+          python -m examples.monitoring_demo
+          python -m examples.recovery_demo
+          python -m examples.security_and_load_demo
+      - name: Whitespace
+        run: git diff --check
+  container:
+    needs: python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.13'
+      - name: Install fixture tooling
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/dev.lock
+      - name: Validate Compose without exposing configuration secrets
+        run: docker compose config --quiet
+      - name: Build, native imports, HTTP security, restart and persistence
+        run: python scripts/container_smoke.py
+      - name: Fresh-clone Compose acceptance
+        run: python scripts/fresh_install_smoke.py --demo

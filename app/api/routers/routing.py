@@ -1,4 +1,4 @@
-"""Unauthenticated routing controls for local development only."""
+"""Authenticated loopback routing controls with separate mutation permission."""
 
 import json
 from typing import Annotated
@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.routing import APIRoute
 
 from app.api.dependencies import get_routing_manager
+from app.api.security import require_operator, require_admin
 from app.api.routers.inference import ModelName
 from app.api.schemas.inference import ErrorResponse
 from app.api.schemas.routing import RoutingResponse, RoutingRollbackRequest, RoutingUpdateRequest
@@ -42,7 +43,8 @@ class RoutingJSONRoute(APIRoute):
 
 
 router = APIRouter(prefix="/routing", route_class=RoutingJSONRoute,
-                   responses={status: {"model": ErrorResponse} for status in (404, 409, 413, 422, 500, 503)})
+                   dependencies=[Depends(require_operator)],
+                   responses={status: {"model": ErrorResponse} for status in (401, 403, 404, 409, 413, 422, 500, 503)})
 Manager = Annotated[RoutingManager, Depends(get_routing_manager)]
 
 
@@ -51,7 +53,8 @@ def get_routing(model_name: ModelName, manager: Manager) -> RoutingResponse:
     return RoutingResponse.from_snapshot(manager.get_routing_config(model_name))
 
 
-@router.put("/{model_name}", response_model=RoutingResponse)
+@router.put("/{model_name}", response_model=RoutingResponse, dependencies=[Depends(require_admin)],
+            description="Loopback administrator key required; operator keys cannot mutate routing.")
 def configure(model_name: ModelName, body: RoutingUpdateRequest, manager: Manager) -> RoutingResponse:
     return RoutingResponse.from_snapshot(manager.configure_routing(model_name, body.weights, body.expected_revision))
 
@@ -61,6 +64,7 @@ def history(model_name: ModelName, manager: Manager) -> list[RoutingResponse]:
     return [RoutingResponse.from_snapshot(item) for item in manager.get_routing_history(model_name)]
 
 
-@router.post("/{model_name}/rollback", response_model=RoutingResponse)
+@router.post("/{model_name}/rollback", response_model=RoutingResponse, dependencies=[Depends(require_admin)],
+             description="Loopback administrator key required; operator keys cannot restore revisions.")
 def rollback(model_name: ModelName, body: RoutingRollbackRequest, manager: Manager) -> RoutingResponse:
     return RoutingResponse.from_snapshot(manager.rollback(model_name, body.target_revision, body.expected_revision))

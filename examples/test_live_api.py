@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 
 import httpx
 
@@ -55,7 +56,8 @@ def verify(base_url: str, deployment_id: str, include_routing: bool = False, inc
                      and not {"inputs", "predictions", "error_message"}.intersection(log) for log in body["logs"])),
         ])
     passed = True
-    with httpx.Client(base_url=base_url, timeout=30.0, trust_env=False) as client:
+    with httpx.Client(base_url=base_url, timeout=30.0, trust_env=False,
+                      headers={"X-API-Key": os.getenv("ADMIN_API_KEY") or os.getenv("OPERATOR_API_KEY") or ""}) as client:
         for method, path, payload, validate in checks:
             try:
                 response = client.request(method, path, json=payload) if payload else client.request(method, path)

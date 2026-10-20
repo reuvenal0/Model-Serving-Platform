@@ -6,7 +6,7 @@ import json
 from threading import Event
 from unittest.mock import Mock
 
-from fastapi.testclient import TestClient
+from tests.api_client import TestClient
 import numpy as np
 import pytest
 from sqlalchemy.engine import URL

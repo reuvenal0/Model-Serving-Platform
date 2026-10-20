@@ -1,0 +1,48 @@
+services:
+  api:
+    build:
+      context: .
+    image: model-serving-platform:local
+    platform: linux/amd64
+    init: true
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: "${CONTAINER_DATABASE_URL:-sqlite:////data/db/model_serving.db}"
+      ARTIFACT_STORAGE_DIR: "${CONTAINER_ARTIFACT_STORAGE_DIR:-/data/artifacts}"
+      TRUST_SKLEARN_ARTIFACTS: "${TRUST_SKLEARN_ARTIFACTS:-false}"
+      MAX_RUNTIME_ARTIFACT_BYTES: "${MAX_RUNTIME_ARTIFACT_BYTES:-104857600}"
+      RUNTIME_CACHE_MAX_SIZE: "${RUNTIME_CACHE_MAX_SIZE:-16}"
+      MAX_REQUEST_BODY_BYTES: "${MAX_REQUEST_BODY_BYTES:-1048576}"
+      MAX_BATCH_SIZE: "${MAX_BATCH_SIZE:-128}"
+      MAX_TENSOR_DIMENSIONS: "${MAX_TENSOR_DIMENSIONS:-4}"
+      MAX_TENSOR_ELEMENTS: "${MAX_TENSOR_ELEMENTS:-100000}"
+      MAX_CONCURRENT_INFERENCE: "${MAX_CONCURRENT_INFERENCE:-4}"
+      MAX_WAITING_INFERENCE: "${MAX_WAITING_INFERENCE:-8}"
+      ADMISSION_WAIT_TIMEOUT_SECONDS: "${ADMISSION_WAIT_TIMEOUT_SECONDS:-5}"
+      # Omitted/unset credentials grant no operational access. Never build args.
+      ADMIN_API_KEY:
+      OPERATOR_API_KEY:
+    volumes:
+      - metadata:/data/db
+      - artifacts:/data/artifacts
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cpus: "${CONTAINER_CPUS:-2.0}"
+    mem_limit: "${CONTAINER_MEMORY:-2g}"
+    pids_limit: 256
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2); assert r.status == 200"]
+      interval: 10s
+      timeout: 3s
+      start_period: 60s
+      retries: 6
+volumes:
+  metadata:
+  artifacts:

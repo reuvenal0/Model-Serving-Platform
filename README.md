@@ -3,7 +3,270 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
-## Current scope: Phase 7.5 - Runtime Recovery & Resource Safety
+## Phase 8B quickstart
+
+Prerequisites: Git and Docker Desktop with a Linux engine (Linux/amd64), or local
+CPython 3.12–3.14. Docker and CI pin CPython **3.12.13**, the base-image digest, and
+all Python wheels with SHA-256 hashes. Windows development is verified with 3.14;
+its convenient editable install is not the Linux hash-locked environment. Python
+3.11 is no longer supported by the pinned NumPy version.
+
+```mermaid
+flowchart LR
+  Host --> Container[Docker container]
+  Container --> API[FastAPI: one application process]
+  API --> Services[Registry, deployment, routing, inference, monitoring]
+  Services --> SQLite[(SQLite volume)]
+  Services --> Artifacts[(Artifact volume)]
+```
+
+Loaded sklearn/ONNX models still execute **inside the API process**. Logical replicas
+and `ResourceConfig` do not allocate isolated CPU/RAM. This is a portfolio MVP,
+not a production deployment.
+
+### Fresh Docker installation — no Python or existing data required
+
+From the repository root, in Windows PowerShell 5.1 or newer:
+
+```powershell
+docker compose config --quiet
+docker compose up --build --detach --wait
+Invoke-RestMethod http://127.0.0.1:8000/health
+docker compose ps
+# Stop and remove containers; keep the named data volumes.
+docker compose down
+```
+
+Ordinary startup installs **no sample model** and requires no API keys. An empty
+registry is valid. Health returns `{"status":"ok"}`. Prediction of an unknown model
+returns 404. Operational endpoints fail closed until credentials are provisioned.
+The equivalent foreground command is `docker compose up --build`; stop with Ctrl+C.
+Change the published port before startup with `$env:APP_PORT = "8080"` if 8000 is busy.
+
+### API keys — no secrets printed or committed
+
+Run this once in the shell used to start the server/Compose. It works on PowerShell
+5.1 without newer `Get-SecureRandom` APIs or a Python installation:
+
+```powershell
+function New-PlatformApiKey {
+    $keyBytes = New-Object byte[] 32
+    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $generator.GetBytes($keyBytes)
+        [Convert]::ToBase64String($keyBytes)
+    } finally { $generator.Dispose() }
+}
+$env:ADMIN_API_KEY = New-PlatformApiKey
+$env:OPERATOR_API_KEY = New-PlatformApiKey
+```
+
+Assignments do not print the keys. Keep them in the process environment; never put
+keys in URLs, source files, screenshots, shell transcripts, or committed configuration.
+Both keys must be distinct, 32–256 visible ASCII characters. Unset keys grant no
+access. Docker daemon owners can inspect container environments and must be trusted.
+Do not publish `docker compose config` output with resolved credentials; use `--quiet`.
+If a container was created before setting keys, recreate it so it receives the new
+environment: `docker compose up --detach --force-recreate --wait` (volumes persist).
+
+### Trusted Docker demo and secure administration
+
+Use a **new Compose project**, so the demonstration cannot touch a normal project's
+volumes. Keep `-p portfolio-demo` on every command in this block. First provision
+keys above. Stop the API before offline registry/deployment tooling:
+
+```powershell
+docker compose -p portfolio-demo up --build --detach --wait
+docker compose -p portfolio-demo stop api
+$env:TRUST_SKLEARN_ARTIFACTS = "true"
+docker compose -p portfolio-demo run --rm --no-deps api python -m examples.seed_development_model
+docker compose -p portfolio-demo up --detach --force-recreate --wait api
+
+# Use literal JSON to preserve a single-row matrix in PowerShell 5.1.
+$prediction = '{"version":"v1","inputs":[[4.0]]}'
+Invoke-RestMethod http://127.0.0.1:8000/predict/demo-linear -Method Post -ContentType application/json -Body $prediction
+# Expected predictions: approximately [9.0]
+
+docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /deployments/demo-api-deployment/health
+docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /metrics/demo-linear --role operator
+docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /inference-logs --role operator
+'{"weights":{"v1":100},"expected_revision":0}' | docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /routing/demo-linear --method PUT --data-stdin
+docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /routing/demo-linear --role operator
+
+docker compose -p portfolio-demo restart api
+# Wait for Healthy in `docker compose -p portfolio-demo ps`, then repeat prediction.
+docker compose -p portfolio-demo exec -T api python scripts/ops_request.py /deployments/demo-api-deployment/health
+docker compose -p portfolio-demo down
+```
+
+The seeder uses the existing registry/manager contracts, verifies existing records
+and artifact bytes, and never overwrites them. Initial routing creation uses expected
+revision 0. On repeated runs **read the current revision first** and supply it for an
+intentional update; a stale revision returns 409 and is not silently repaired. For
+optional v2 (`y=3x+1`), stop the API and run `examples.seed_routing_models` through the
+same offline Compose procedure; existing v1 and operator routing are preserved.
+Only locally trained artifacts are trusted. Never enable Pickle trust for arbitrary
+or externally supplied artifacts.
+
+Host-published operational requests and `/docs` return 403 **even with a correct key**
+on the supported Docker bridge setup. Host port binding to 127.0.0.1 does not make
+the application's peer loopback. Management uses authenticated HTTP to genuine
+`127.0.0.1` **inside** the container via `exec`; no proxy or forwarded header is trusted.
+The CLI disables proxies/redirects and reads credentials from the container environment.
+Operator keys read metrics, logs, resources, and routing only. Routing mutations,
+rollback, and deployment health refresh require administrator authorization; health
+refresh can persist a failure. Public prediction and process liveness require no key.
+Secure Docker rejects development Swagger even if someone explicitly sets its flag.
+
+### Local Python development and Chrome Swagger
+
+Use a separate demo database rather than the existing repository development data:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+New-Item -ItemType Directory -Force .tmp | Out-Null
+$env:DATABASE_URL = "sqlite:///./.tmp/local-demo.db"
+$env:ARTIFACT_STORAGE_DIR = ".tmp/local-demo-artifacts"
+# Generate both environment keys using New-PlatformApiKey above BEFORE startup.
+$env:TRUST_SKLEARN_ARTIFACTS = "true"
+python -m examples.seed_development_model
+$env:APP_ENV = "development"
+$env:ENABLE_DEV_SWAGGER = "true"
+python -m scripts.run_local
+```
+
+Open Chrome at **http://127.0.0.1:8000/docs**. The supported launcher always binds
+loopback, disables proxy-header trust, and uses one worker. Development Swagger
+requires both flags, a loopback peer and loopback Host/Origin; cross-site contexts
+and forwarded-header spoofing are rejected. `/docs`, `/docs/oauth2-redirect`, and
+`/openapi.json` become browser-accessible without granting operational permission.
+Swagger's **Authorize** button accepts `X-API-Key`. In your private local shell,
+`Set-Clipboard -Value $env:OPERATOR_API_KEY` copies a key without printing it; paste
+it into Authorize and clear your clipboard afterward. Do not enable Swagger
+authorization persistence. Leave it empty to verify protected
+Execute calls return 401. An operator key cannot authorize administrator operations.
+No key is embedded in browser application code. Swagger JS/CSS are fetched from the
+standard FastAPI CDN; internet access is required for those assets.
+
+Stop the local server with **Ctrl+C**, then disable browser mode before restarting:
+
+```powershell
+Remove-Item Env:ENABLE_DEV_SWAGGER -ErrorAction SilentlyContinue
+Remove-Item Env:APP_ENV -ErrorAction SilentlyContinue
+python -m scripts.run_local
+```
+
+With development mode disabled, local Swagger/schema/redirect access requires a
+key (401 without one); operational authorization never changes. Binding a public
+interface or using a reverse proxy is unsupported. Local CLI examples, in a second
+shell with the **same keys and data settings**, are:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8000/predict/demo-linear -Method Post -ContentType application/json -Body '{"version":"v1","inputs":[[4.0]]}'
+Invoke-RestMethod http://127.0.0.1:8000/metrics/demo-linear -Headers @{"X-API-Key"=$env:OPERATOR_API_KEY}
+Invoke-RestMethod http://127.0.0.1:8000/inference-logs -Headers @{"X-API-Key"=$env:OPERATOR_API_KEY}
+Invoke-RestMethod http://127.0.0.1:8000/routing/demo-linear -Method Put -ContentType application/json -Headers @{"X-API-Key"=$env:ADMIN_API_KEY} -Body '{"weights":{"v1":100},"expected_revision":0}'
+```
+
+### Final SQLite schema and persistence policy
+
+Seven application tables cover models, versions, deployments, routing current/history/
+version references, and inference logs. ORM metadata defines all indexes, uniqueness,
+checks, foreign keys, and SQLite history-immutability triggers. A captured former
+complete-schema fixture proves equivalence of these 15 schema objects. Fresh startup
+creates them transactionally; failure rolls back the whole bootstrap. There are no
+numbered migration modules or fresh migration ledger.
+
+**Historical SQLite schema upgrades are intentionally unsupported.** Existing schemas
+are compared against a private in-memory final-schema reference before any DDL. An
+exactly compatible database is opened without CREATE/ALTER/DROP or data updates by
+initialization. Missing tables/indexes/triggers, altered constraints/columns, or unknown
+objects fail with a sanitized incompatible-schema diagnostic. Do not delete data to
+silence that error: choose a separate empty database or perform a deliberate offline
+export/import yourself. A preexisting unused `schema_migrations` ledger is tolerated
+and left untouched; the application does not read its version rows or perform upgrades.
+
+Schema validation is conservative about DDL equivalence; manually edited but logically
+similar schemas can be rejected. Startup recovery is separate from schema initialization:
+it loads/revalidates persisted RUNNING deployments, marks interrupted DEPLOYING records
+FAILED, and may persist legitimate lifecycle changes. It retains revision guards and
+isolates per-deployment recovery failures. Never run offline seeders or another lifecycle
+owner against a live API. SQLite, cache, admission, and lifecycle coordination remain
+single-process.
+
+Docker metadata is `/data/db/model_serving.db` in the project-scoped `metadata` named
+volume; artifacts are `/data/artifacts` in `artifacts`. UID/GID 10001 owns these private
+writable directories. The image is non-root with a read-only root filesystem, writable
+bounded `/tmp`, dropped capabilities, and no-new-privileges. The normal Windows defaults
+remain `model_serving.db` and `artifacts/` relative to the working directory; acceptance
+scripts never use them. `docker compose down` preserves data; **do not use `down -v`**
+on a project whose data you want to keep.
+
+### Reproducibility, CI, verification and troubleshooting
+
+`requirements/runtime.lock`, `dev.lock`, and `build.lock` distinguish runtime, test/lint,
+and build tooling. Every wheel is pinned and hash-checked for Linux x86_64/CPython 3.12.
+`requirements/*.in` are deliberate update inputs; regenerate with
+`python scripts/lock_dependencies.py`, review the diff, and re-run all checks. Docker
+uses binary wheels only and verifies real sklearn prediction and ONNX Runtime native
+imports during build. CI pins maintained checkout/setup-python actions by commit SHA
+with read-only permissions. Its Python job runs imports, layer checks, focused Ruff
+correctness rules, every pytest test, and all eight demos. Its container job builds,
+checks security, persists/recreates data, and tests an isolated fresh Compose install.
+No secrets, pushes, or sensitive artifact uploads are needed. Broad type checking is
+not configured; this phase does not claim a global mypy/pyright audit.
+
+```powershell
+python -m pytest -q
+python scripts/check_project.py
+python -m ruff check app examples scripts tests
+docker compose config --quiet
+python scripts/container_smoke.py
+python scripts/fresh_install_smoke.py --demo
+git diff --check
+```
+
+The smoke runners use UUID names, clean source copies and **disposable test volumes**,
+never normal development project volumes. The storage runner proves real container
+recreation, immutable metadata/artifact/history fingerprints, retained inference IDs,
+recovery, public sklearn/ONNX predictions, keys/roles, and rejected host management.
+The fresh runner starts without a venv, database, artifacts, credentials, or sample
+records. Docker checks require an available Linux Docker engine and are never reported
+as passed merely because CLI/configuration validation succeeded.
+
+Compose defaults: host port `APP_PORT=8000` bound only to 127.0.0.1, `CONTAINER_CPUS=2.0`,
+`CONTAINER_MEMORY=2g`, 256 PIDs, cache 16, active inference 4, waiting 8, admission wait
+5 seconds, body 1 MiB, batch 128, tensor rank 4/elements 100000, artifact load 100 MiB,
+and `TRUST_SKLEARN_ARTIFACTS=false`. Existing Settings limit environment variables pass
+through Compose. Custom `CONTAINER_DATABASE_URL` and `CONTAINER_ARTIFACT_STORAGE_DIR`
+must resolve under suitably mounted writable directories. Container memory/CPU limits
+apply to the whole application, **not per model**; RSS is observational, not enforcement.
+
+For 401, check that keys existed before server startup. For Docker 403, use the
+container-local management channel; do not weaken loopback guards. For 404 prediction,
+prepare/deploy the sample in that same project's volumes. For SQLite permission errors,
+check volume ownership; don't run as root or chmod unrelated host data. For 503, inspect
+admission counters, deployment readiness and startup diagnostics through an authorized
+channel. On schema incompatibility use a new isolated database, never automatic repair.
+If Docker cannot connect, start Docker Desktop's Linux engine. The existing Starlette/
+AnyIO deprecation warning remains documented, not suppressed. ONNX Runtime can also
+warn that a telemetry device ID cannot be persisted under the non-root read-only
+image; it falls back to an in-memory ID. This does not indicate model-readiness failure.
+
+SIGTERM reaches the single Uvicorn worker through Docker init. Admission stops accepting
+work, keeps active accounting, and drains native work before closing caches/engine.
+Uvicorn's graceful-wait setting is 50 seconds and Compose's stop grace is 60 seconds;
+Docker eventually sends SIGKILL after that grace. Uvicorn may restore SIGTERM
+after clean shutdown, producing exit 143 through Tini; the smoke tests require the
+completed-shutdown diagnostic and accept only 0/143, never SIGKILL exit 137. Stuck native execution can outlast
+it; hard termination may lose best-effort logs and cannot promise crash-safe workflows.
+There is no process isolation, hard execution timeout, production authentication,
+distributed lifecycle management, Phase 8C load-testing system, or Phase 9 Worker.
+
+## Current scope: Phase 8B - Reproducible Local and Docker Development
 
 Phase 2 provides model and version registration, persistent SQLite metadata,
 local binary artifact storage, artifact downloads, and version deletion through a
@@ -17,7 +280,8 @@ and a small FastAPI transport. Phase 6 adds deployment-aware weighted routing,
 canary allocations, revisioned routing persistence, and validated rollback. Phase 7
 adds persistent sanitized inference observations and windowed metrics through
 local monitoring endpoints. Phase 7.5 adds automatic startup reconciliation, bounded
-runtime artifact retrieval, and process/cache resource visibility.
+runtime artifact retrieval, and process/cache resource visibility. Phase 8A adds
+loopback API-key authorization and bounded HTTP inference admission.
 
 ```text
 ModelRegistry
@@ -351,8 +615,8 @@ and [SQLite concurrency documentation](https://docs.sqlalchemy.org/en/20/dialect
 
 `initialize_database()` creates missing tables, including the new deployment table,
 without altering existing ones. Phase 6 additionally runs the numbered routing
-migration described below. Incompatible legacy layouts still require explicit
-operator migration; no general ALTER TABLE/backfill automation is provided.
+final schema described above. Historical upgrades and ALTER TABLE/backfill automation
+are deliberately unsupported; choose a new empty database for an incompatible layout.
 
 ### Lifecycle orchestration and failures
 
@@ -461,7 +725,7 @@ Versions with no deployment history retain the original deletion behavior.
 ## Phase 5 inference and HTTP architecture
 
 ```text
-HTTP -> FastAPI synchronous router -> InferenceService
+HTTP -> FastAPI router -> bounded inference pool -> InferenceService
                                       +-- ModelRepository
                                       +-- DeploymentRepository (revision snapshots)
                                       +-- DeploymentHealthChecker
@@ -491,7 +755,7 @@ After installing `.[dev]`, start locally:
 python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-Swagger documentation is at `/docs`; `/openapi.json` includes the request,
+Authenticated loopback documentation is at `/docs`; `/openapi.json` includes the request,
 response, and structured error schemas. Explicit versions preserve the Phase 5
 behavior; Phase 6 also permits omitted versions using configured weighted routing.
 Register/deploy models through Python services (see the API demo); registration,
@@ -516,12 +780,11 @@ validates runtime readiness and deployment revision. Persisted RUNNING alone is
 never used as verified readiness.
 
 Lifespan ownership follows [FastAPI's lifecycle guidance](https://fastapi.tiangolo.com/advanced/events/).
-Routes use ordinary `def`, so blocking loading/prediction runs through FastAPI's
-[external worker thread pool](https://fastapi.tiangolo.com/async/). Pool workers are
-shared across requests/dependencies and finite; requests may queue. Per-runtime
-prediction locks and native ML thread pools may further constrain concurrency.
-There are no distributed limits, prediction timeouts, cancellation guarantees,
-or process isolation. Servers must drain requests before closing owned resources.
+Prediction routes acquire bounded admission asynchronously, then run synchronous
+loading/prediction in a dedicated thread pool. Operational service handlers still
+use FastAPI's shared thread pool. Per-runtime serialization and native library
+thread pools may further constrain concurrency. See Phase 8A below for safe
+cancellation, queue limits, and shutdown draining.
 
 ### Endpoints and wire format
 
@@ -658,10 +921,10 @@ liveness does not load models or claim every deployment is ready.
 
 The container defaults to **TRUST_SKLEARN_ARTIFACTS=false**. Enable it only after
 establishing trust in the artifact source/root; it is acknowledgement, not a
-sandbox or provenance verifier. All execution remains in-process. The API has no
-authentication, tenant isolation, production rate limiting, or worker isolation;
-those are outside this phase. Phase 6 routing management endpoints are strictly
-for local development until authorization and authentication are implemented.
+sandbox or provenance verifier. All execution remains in-process. Phase 8A adds
+API-key authorization for loopback operational access, but no tenant isolation,
+production rate limiting, or worker isolation. Prediction remains public for local
+development; bind to loopback and do not expose this MVP to untrusted networks.
 
 ## Current limitations
 
@@ -672,15 +935,15 @@ for local development until authorization and authentication are implemented.
 - Individual repository operations and artifact publication are atomic, but the
   full registry workflow is not isolated across backends. Concurrent downloads
   can observe deletion, and complex concurrent workflows need caller coordination.
-- Legacy tables retain their initialization behavior; a numbered additive migration
-  installs routing tables. General schema evolution/backfill tooling is not implemented.
+- Only the final SQLite schema is supported. Existing compatible databases are validated
+  read-only; historical upgrades and automatic repairs are not implemented.
 - Artifacts use an in-memory bytes API. Streaming and configured upload-size
   enforcement are not implemented. POSIX storage requires hard-link support.
 - Deployment history prevents version deletion even after stopping. No history
   archival/purge policy is implemented. Routing history also retains version references,
   including zero-weight versions, and blocks deletion without controlled history cleanup.
 - Model loading and prediction run inside the application process, with no worker
-  subprocess, process isolation, timeout, cancellation, or resource enforcement.
+  subprocess, process isolation, hard execution timeout, native cancellation, or per-model resource enforcement.
   A bad artifact/backend can exhaust resources or crash the process.
 - Runtime caches are process-local and count models, not memory bytes. Concurrent
   in-progress loads are not capacity-limited. Each runtime serializes its own
@@ -689,7 +952,7 @@ for local development until authorization and authentication are implemented.
   Callers must invalidate affected entries or clear caches and coordinate any
   concurrent registry changes. Existing users of a detached runtime may finish.
 - Deployment currently means logical readiness in this application instance.
-  Remote/container orchestration, real replica workers, authentication,
+  Remote/container orchestration, real replica workers, identity-provider integration,
   background workers, cloud adapters, and distributed coordination are not implemented.
   REST endpoints cover prediction, health, local routing management, and monitoring.
 
@@ -821,7 +1084,7 @@ against the working directory. Existing `DATABASE_URL` and `ARTIFACT_STORAGE_DIR
 environment settings are honored unchanged by both seed and server. No `.env`
 file is loaded automatically. Persistent data remains after either process exits.
 
-Open [Swagger UI](http://127.0.0.1:8000/docs), select `POST /predict/{model_name}`,
+Open [Swagger UI](http://127.0.0.1:8000/docs) using a client/browser extension that supplies `X-API-Key` (required since Phase 8A), then select `POST /predict/{model_name}`,
 enter `demo-linear`, and submit:
 
 ```json
@@ -890,15 +1153,10 @@ History protects metadata references; it is **not** an artifact backup, retentio
 archive, or guarantee against filesystem loss. Keep artifacts and dependencies
 available for future rollback.
 
-The numbered migration `app/infrastructure/database/migrations.py` installs the
-three routing tables, immutability triggers, and a `schema_migrations` ledger entry
-(version 6) in one transaction. Legacy model/version/deployment tables remain
-unchanged. `initialize_database()` invokes this migration before serving traffic;
-it does not use `create_all()` to evolve the routing schema. Repeated initialization
-checks the ledger. Unexpected untracked routing tables fail rather than being
-silently adopted. Perform initialization during quiescent startup; concurrent
-startup writers may require an operator retry. This is a focused additive migration,
-not a general migration framework.
+The final metadata defines all routing tables, indexes, foreign keys, and immutable
+history triggers. Fresh SQLite databases bootstrap directly; compatible databases
+are validated without DDL or data changes. Historical schema upgrades are intentionally
+unsupported. See the Phase 8B quickstart and final-schema policy above.
 
 ### Eligibility, readiness, and admission
 
@@ -940,8 +1198,8 @@ spans prediction, and existing runtime caching and prediction locks are unchange
 
 ### Local routing management API
 
-These controls have **no authentication or authorization** and must not be exposed
-publicly. They use synchronous handlers in the existing finite FastAPI thread pool.
+These controls require a loopback peer and an API key. Operator keys may read;
+only administrator keys may update or roll back. They must not be exposed publicly. They use synchronous handlers in the existing finite FastAPI thread pool.
 Existing body, tensor, and batch limits still apply.
 
 | Method | Endpoint | Purpose |
@@ -1026,7 +1284,7 @@ After the optional v2 setup, add `--routing` to these live checks to read the
 current allocation and verify an automatic v1/v2 prediction without changing it:
 `python -m examples.test_live_api --routing`.
 
-Use Swagger `/docs` for optional-version predictions and routing controls. No
+Use authenticated loopback Swagger `/docs` for optional-version predictions and routing controls. No
 external server is needed for the deterministic routing demonstration:
 
 ```powershell
@@ -1151,7 +1409,7 @@ affect interpretation. No liveness or health-check traffic inflates request coun
 
 ### Monitoring API and pagination
 
-All endpoints are local-development-only without authentication/authorization.
+All monitoring endpoints require a loopback peer and an operator or administrator API key.
 They use the existing synchronous FastAPI thread pool and sanitized error handlers.
 
 | Method | Endpoint | Response |
@@ -1188,7 +1446,7 @@ matching timestamps may appear on later pages. A fresh default window on each
 page changes the query. No raw SQL IDs, error messages, inputs, or outputs are
 exposed in log records; the cursor is the opaque continuation value to reuse.
 
-Examples in Swagger `/docs` or a browser:
+Examples using authenticated Swagger `/docs` or an HTTP client with `X-API-Key`:
 
 ```text
 /metrics/demo-linear?version=v1
@@ -1200,49 +1458,15 @@ Examples in Swagger `/docs` or a browser:
 
 Migration **7** adds only `inference_logs` and indexes for completion time and
 model/version/time filtering. It reuses explicit UTC storage and unique request IDs.
-`initialize_database()` applies numbered migrations 6 and 7 during normal container
-startup. It does not use `create_all()` to migrate monitoring tables. Run startup
-quiescently and back up development data before schema upgrades. Unexpected
-untracked tables fail explicitly; DDL and the migration ledger entry commit
-atomically. Tests simulate an interrupted migration and verify successful retry.
-Existing models, versions, deployment revisions, immutable routing history, and
-artifact bytes are preserved. Logs intentionally have no registry foreign keys:
-failed attempts may refer to missing versions, and observations neither retain
-artifacts nor prevent registry deletion. No retention/purge service is implemented.
-
-No extra connection, session, executor, or cache is globally owned by monitoring.
-Each repository operation uses the injected session factory with its own explicit
-transaction; application shutdown disposes the container's existing engine. Reads
-see committed records in the selected SQLite file, not a production-wide,
-consistent distributed snapshot. SQLite writer contention can delay appends or
-cause best-effort loss; no cross-process delivery or aggregation guarantee is claimed.
-
-```powershell
-python -m pytest -q
-python -m examples.monitoring_demo
-python -m examples.test_live_api --monitoring
-# With optional v2 routing already seeded:
-python -m examples.test_live_api --routing --monitoring
-```
-
-The monitoring demo creates temporary SQLite/artifacts, deploys two trusted sklearn
-versions, configures routing, executes explicit and routed/batched inference,
-records a controlled failure, reads logs and aggregate/per-version metrics, checks
-repository/container restart persistence, and removes temporary data. Existing
-persistent v1/v2 seeders and routing configurations are unchanged. Live verification
-checks metrics/logs optionally; default Phase 5/6 checks remain compatible. Its
-prediction requests naturally add observations but never overwrite artifacts or
-change routing. No automated test writes to persistent development storage.
-
-Phase 8 hardening, Prometheus/Grafana, tracing, OpenTelemetry, brokers, authentication,
-automated canary decisions, autoscaling, and long-term archival remain out of scope.
-
-## Phase 7.5 recovery and resource safety
+`initialize_database()` creates the complete final schema only for an empty database.
+Existing schemas are validated before any DDL; incomplete/older layouts fail closed.
+There is no migration ledger on fresh installations and no historical upgrade path.
+Rehearse changes only against disposable databases, never against development data.
 
 ### Startup ownership and recovery policy
 
 The FastAPI lifespan constructs the application-owned `ServiceContainer`, performs
-existing migrations, and runs the existing `DeploymentManager.reconcile()` in a
+the final-schema compatibility check, and runs the existing `DeploymentManager.reconcile()` in a
 worker thread **before startup completes or HTTP dependencies expose services**.
 Caller-injected containers also reconcile; their cleanup remains caller-owned.
 Overlapping lifespans on the same application instance are rejected. Concurrent
@@ -1280,7 +1504,7 @@ Logical replicas remain metadata; no independent workers or CPU/RAM quotas exist
 | FAILED / STOPPED | Leave inactive; do not load historical models |
 | Missing/corrupt/oversized artifact, INVALID version, disabled sklearn trust | Record per-deployment failure, detach unavailable cached references where applicable, persist FAILED under revision guard, continue with other deployments |
 | Revision conflict / concurrent stop | Report isolated conflict; never overwrite newer lifecycle state |
-| Database open/migration/list failure, repository infrastructure failure, or non-conflict failure recording recovery state | Abort startup; owned resources close; no serving readiness is advertised |
+| Database open/schema/list failure, repository infrastructure failure, or non-conflict failure recording recovery state | Abort startup; owned resources close; no serving readiness is advertised |
 
 The API may start with some deployments unavailable. `/health` remains process
 liveness and does not claim all models are ready. The startup report contains explicit
@@ -1355,7 +1579,7 @@ Cache counters retain their existing lifetime semantics; clear does not reset th
 `current_size` is completed cached runtimes, not resident bytes; `in_flight` counts
 tracked loads and excludes detached generations still held by callers. No model names,
 artifact paths, process IDs, command lines, or environment settings are exposed.
-This unauthenticated endpoint must not be exposed publicly.
+This endpoint requires a loopback peer and an operator or administrator API key; it must not be exposed publicly.
 
 The injected `RuntimeResourceMonitor` uses a small standard-library platform probe:
 Windows reports current working-set bytes through `GetProcessMemoryInfo`; Linux reads
@@ -1385,3 +1609,136 @@ unchanged. No new database schema migration is required for Phase 7.5.
 Phase 8 packaging, process workers/isolation, real replicas, autoscaling, distributed
 locking, memory-aware eviction, cloud infrastructure, and hard CPU/RAM limits are not
 implemented.
+
+## Phase 8A security and bounded inference
+
+### Credentials and endpoint policy
+
+Set distinct, randomly generated credentials through environment variables. Values
+must be 32–256 visible ASCII characters without spaces; unset keys grant no access.
+Settings hide credentials from their representation. Deployment health refresh retains its
+existing behavior and can persist a failed result, so that endpoint requires the
+administrator role. Operator endpoints do not modify persistent application state. No default secret exists.
+For example, in PowerShell (keep this shell open for server and live-verifier runs):
+
+```powershell
+$env:ADMIN_API_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:OPERATOR_API_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Enable only for artifacts whose origin and storage you explicitly trust.
+$env:TRUST_SKLEARN_ARTIFACTS = "true"
+python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000 --workers 1 --no-proxy-headers
+```
+
+Send `X-API-Key` as a header, never as a URL parameter. Do not commit secrets or
+paste them into diagnostics. Rotate by changing settings and restarting; both roles
+use constant-time byte comparison. Missing, malformed, duplicate, or invalid keys
+receive a sanitized 401; insufficient permissions and non-loopback peers receive
+403. Protected endpoints fail closed even when no keys are configured.
+
+| Endpoint | Permission |
+| --- | --- |
+| `GET /health` | Public process liveness |
+| `POST /predict/{model_name}` and `/batch` | Public local-development inference |
+| `GET /deployments/{id}/health` | Administrator (readiness refresh may persist failures) |
+| All routing reads, metrics, inference logs, `/runtime/resources`, `/runtime/admission` | Operator or administrator |
+| Routing `PUT` and rollback `POST` | Administrator only |
+| `/docs` and `/openapi.json` | Operator or administrator; `/redoc` is disabled |
+
+Every protected endpoint also requires a loopback peer address (IPv4, IPv6, or
+IPv4-mapped loopback). Authentication does not replace this restriction. Application
+checks do not trust forwarded headers; run with `--no-proxy-headers` so the server
+does not rewrite the peer address. A local reverse proxy can defeat peer locality;
+proxy exposure is unsupported. No CORS relaxation is enabled.
+
+OpenAPI describes the header security scheme and protected operations. To view
+Swagger, use a browser extension or HTTP client supplying the viewing key on the
+initial `/docs` request. Its schema is embedded without the credential. Swagger's
+**Authorize** control separately sets the header for interactive protected requests.
+Swagger uses external JavaScript/CSS assets; disable access at the network/browser
+boundary if those resources are unsuitable. With development Swagger disabled, plain browser navigation without a key
+receives 401. The explicitly opt-in local browser mode is described above. The live verifier reads `ADMIN_API_KEY` or `OPERATOR_API_KEY` from
+its environment. Existing demos generate ephemeral keys and use temporary data.
+No database migration or persistent development-model change is needed.
+
+### Admission, waiting, and timeouts
+
+| Environment setting | Default | Meaning |
+| --- | --- | --- |
+| `MAX_CONCURRENT_INFERENCE` | 4 | Positive maximum submitted/running HTTP inference operations |
+| `MAX_WAITING_INFERENCE` | 8 | Nonnegative FIFO queue capacity; zero rejects immediately when busy |
+| `ADMISSION_WAIT_TIMEOUT_SECONDS` | 5 | Finite positive maximum wait for a capacity slot |
+
+After bounded body parsing, HTTP/Pydantic validation, and dependency resolution,
+prediction routes acquire capacity before submitting work to a dedicated bounded
+`ThreadPoolExecutor`. Queueing consumes no worker thread. Nonblocking dependency
+getters run on the event loop. No unbounded executor submission queue is used:
+there are at most the configured number of submitted operations. Both prediction
+routes share one limiter per application lifespan. Direct Python service calls,
+startup recovery, and authorized operational health checks are outside this HTTP
+inference limit. Transport connections and body reception need separate server
+limits; this is not a global HTTP connection limiter or a model-memory budget.
+
+A slot covers routing, deployment/revision admission, runtime loading/readiness,
+prediction, normalization, best-effort observation persistence, and response DTO
+conversion. It excludes incoming body/network transfer and outgoing response send.
+A queued request checks current routing/deployment state only when execution begins;
+existing revision guards and explicit-version bypass remain unchanged. Requests
+already admitted by deployment revision may finish after undeploy.
+
+Queue-full and admission-wait expiry return sanitized 503
+`inference_capacity_unavailable`. There is no `Retry-After`, since completion times
+cannot be predicted. A queue timeout removes the waiter and never starts its work.
+Queued cancellation removes the waiter; cancellation concurrent with slot transfer
+releases that slot exactly once. After submission, HTTP cancellation only stops
+waiting for the response. The actual concurrent future remains alive, and its slot
+is released only when synchronous work completes, even if it fails. Detached
+exceptions are consumed without logging backend messages. Shutdown rejects queued
+work and drains submitted operations before closing caches/database resources,
+even if shutdown waiting itself is cancelled.
+
+Only admission waiting has an enforced timeout. Loading, native execution, logging,
+and total HTTP duration have **no hard timeout** here. A stuck operation can occupy
+a slot and delay graceful shutdown indefinitely. Client/proxy disconnects and
+HTTP timeouts do not terminate native sklearn/ONNX execution. Hard execution
+cancellation and crash isolation require separate Workers in Phase 9. Per-runtime
+prediction serialization is preserved; native libraries may spawn multiple threads
+within each admitted request. Limits are per application process, not distributed;
+coordinated multi-worker lifecycle management remains unsupported.
+
+### Operational counters and verification
+
+`GET /runtime/admission` returns typed, bounded-cardinality process-lifetime
+counters: `active`, `waiting`, `capacity`, `waiting_capacity`, `capacity_rejections`,
+`wait_timeouts`, `admitted_requests`, `total_admission_wait_seconds`,
+`max_admission_wait_seconds`, and `wait_timeout_seconds`. Total/max waiting times
+refer to admitted requests (including later inference failures), measured with a
+monotonic wall clock. Queue-full rejections and wait expirations have separate
+counts. Counters reset each lifespan; they are not persisted or model-labeled.
+
+Overload/authentication/HTTP validation rejects occur outside InferenceService and
+do not create inference observations or inflate its error rate. Work that starts
+InferenceService retains the existing single finalized best-effort observation,
+including after an HTTP disconnect. Monitoring write failures still emit one
+sanitized ERROR without changing prediction success or masking inference errors.
+Unexpected API errors now also omit private messages and stack traces from internal
+diagnostics. An ASGI boundary contains ordinary failures before Starlette can
+re-raise the private exception to server logging; if headers were already sent, it
+raises only a sanitized, context-suppressed response-abort error. Existing body, tensor, output, artifact-size, path, and trusted-only
+Pickle protections remain in force. API keys are not a complete production security
+boundary: TLS, identity management, auditing, connection limits, tenant isolation,
+production rate limiting, native crash isolation, and distributed coordination
+remain absent. Bind to loopback and treat all model artifacts as privileged code.
+
+```powershell
+python -m pytest -q
+python -m examples.security_and_load_demo
+python -m examples.test_live_api --routing --monitoring
+```
+
+The isolated demonstration verifies unauthorized/authorized operational access,
+real inference, a controlled native workload, a 503 overload response, retained
+capacity during execution, recovery, and counters without modifying development
+SQLite or artifacts. Existing contract tests explicitly supply ephemeral credentials
+and loopback peers; dedicated security tests exercise the unmodified fail-closed
+dependencies. Phase 8C, isolation, and distributed serving are not implemented. Phase 8B now
+provides Docker and CI as described above.
