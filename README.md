@@ -209,6 +209,155 @@ python -m pytest -q
 
  Tests cover registration, deployments, correctness, routing, monitoring, error handling, authorization and concurrency. CI lives in [.github/workflows/ci.yml](.github/workflows/ci.yml). The previous documented baseline was **995 tests passed**; rerun pytest for the count at your revision.
 
+
+
+## Architecture
+
+The platform follows a layered modular-monolith architecture. Business services depend on interfaces rather than concrete infrastructure, with dependencies wired through a central container.
+
+```mermaid
+flowchart TB
+    Client["HTTP Client"]
+
+    subgraph API["API Layer — FastAPI"]
+        direction LR
+        RegistryAPI["Model Router"]
+        DeployAPI["Deployment Router"]
+        InferAPI["Inference Router"]
+        RoutingAPI["Routing Router"]
+        MonitorAPI["Monitoring Router"]
+        Auth["Authentication & Authorization"]
+    end
+
+    subgraph Services["Application Services"]
+        direction LR
+        Registry["ModelRegistry"]
+        Deployment["DeploymentManager"]
+        Inference["InferenceService"]
+        RoutingManager["RoutingManager"]
+        Router["TrafficRouter"]
+        Metrics["MetricsCollector"]
+        Runtime["ModelRuntimeManager"]
+        Health["DeploymentHealthChecker"]
+        Admission["InferenceAdmission"]
+    end
+
+    subgraph Contracts["Interfaces / Ports"]
+        direction LR
+        Repositories["Model / Deployment / Routing / Log Repositories"]
+        Storage["ArtifactStorage"]
+        Loader["ModelLoader / LoadedModel"]
+        Strategy["RoutingStrategy"]
+    end
+
+    subgraph Infrastructure["Infrastructure / Adapters"]
+        direction LR
+        SQLite["SQLite Repositories / SQLAlchemy"]
+        Files["LocalArtifactStorage"]
+        ONNX["ONNXModelLoader"]
+        Sklearn["SklearnModelLoader"]
+        Weighted["WeightedRandomStrategy"]
+    end
+
+    subgraph Data["Persistent Data"]
+        direction LR
+        DB[("SQLite Database")]
+        Artifacts[("Model Artifacts")]
+    end
+
+    Client --> API
+
+    RegistryAPI --> Registry
+    DeployAPI --> Deployment
+    InferAPI --> Admission
+    Admission --> Inference
+    RoutingAPI --> RoutingManager
+    MonitorAPI --> Metrics
+    Auth -.-> API
+
+    Inference --> Router
+    Inference --> Runtime
+    Inference --> Metrics
+
+    Deployment --> Health
+    Deployment --> Runtime
+    RoutingManager --> Router
+
+    Registry --> Repositories
+    Registry --> Storage
+    Deployment --> Repositories
+    Router --> Repositories
+    Router --> Strategy
+    Metrics --> Repositories
+    Runtime --> Loader
+    Runtime --> Storage
+
+    Repositories -.-> SQLite
+    Storage -.-> Files
+    Loader -.-> ONNX
+    Loader -.-> Sklearn
+    Strategy -.-> Weighted
+
+    SQLite --> DB
+    Files --> Artifacts
+
+    classDef api fill:#173454,stroke:#528bc4,color:#ffffff
+    classDef service fill:#153d35,stroke:#4ea68a,color:#ffffff
+    classDef contract fill:#44345d,stroke:#a28bc4,color:#ffffff
+    classDef infra fill:#493a25,stroke:#c4a06a,color:#ffffff
+
+    class RegistryAPI,DeployAPI,InferAPI,RoutingAPI,MonitorAPI,Auth api
+    class Registry,Deployment,Inference,RoutingManager,Router,Metrics,Runtime,Health,Admission service
+    class Repositories,Storage,Loader,Strategy contract
+    class SQLite,Files,ONNX,Sklearn,Weighted infra
+```
+
+**Key design decisions**
+- **Dependency Injection:** Services use interfaces; infrastructure supplies concrete implementations.
+- **Model Execution:** ONNX and trusted scikit-learn run in-process, with lazy loading and an LRU cache.
+- **Traffic Management:** Weighted routing supports canary deployments and revision-based manual rollback.
+- **Persistence:** SQLite and local artifact storage survive container recreation.
+- **Scaling:** Replicas are logical metadata; independent model workers are not implemented.
+
+
+
+### Prediction Request Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as FastAPI
+    participant G as Admission Controller
+    participant I as InferenceService
+    participant T as TrafficRouter
+    participant R as ModelRuntimeManager
+    participant M as LoadedModel
+    participant L as MetricsCollector
+
+    C->>A: POST /predict/{model_name}
+    A->>G: Acquire bounded execution capacity
+    G->>I: Execute prediction
+
+    opt Version omitted
+        I->>T: Select weighted version
+        T-->>I: Selected version
+    end
+
+    I->>R: Get or load model runtime
+    R-->>I: Cached or newly loaded runtime
+
+    Note over I,R: Validate input and deployment readiness
+    I->>M: predict(inputs)
+    M-->>I: Predictions
+
+    I->>L: Record success or failure
+    Note over L: Best-effort persistence
+    I-->>G: Inference result
+    G-->>A: Release capacity
+    A-->>C: JSON prediction response
+```
+
 ## Troubleshooting
 
 | Issue | What to check |
