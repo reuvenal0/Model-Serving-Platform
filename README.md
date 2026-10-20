@@ -3,6 +3,8 @@
 A Python portfolio project exploring object-oriented design, SOLID principles,
 and a layered modular monolith for machine learning model serving.
 
+For the interview walkthrough, see the [official two-version ONNX portfolio demo](examples/portfolio_demo/README.md): Docker setup, predictions, canary routing, monitoring, rollback and restart verification, with Pickle trust disabled.
+
 ## Minimal management quickstart (Phase 8B.1)
 
 From the repository root in PowerShell, after installing `.[dev]` as described below:

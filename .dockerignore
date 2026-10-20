@@ -35,3 +35,9 @@
 **/.git/
 **/.venv/
 **/.tmp/
+# Only these reviewed demo files are exceptions to the generated-artifact ban.
+!examples/portfolio_demo/
+!examples/portfolio_demo/demo.py
+!examples/portfolio_demo/README.md
+!examples/portfolio_demo/v1.onnx
+!examples/portfolio_demo/v2.onnx
